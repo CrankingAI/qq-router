@@ -329,6 +329,13 @@ costs more; that is what the 100,000 character cap is for.
 `routingMode` is the cost lever. `cost` biases toward cheaper models, `quality`
 toward stronger ones, `balanced` sits between.
 
+How much routing you actually observe depends on how far apart your subset is.
+The default three `gpt-5.6-*` models are close in capability, and in testing
+`balanced` selected `gpt-5.6-luna` for everything from `what does chmod 755
+mean` to a proof of the halting problem. Add a genuinely cheaper model such as
+`gpt-5.4-nano` to `routerModels` if you want the router to have somewhere
+cheaper to go. `--verbose` always shows which model answered.
+
 > **Third-party models are excluded on purpose.** The router's full candidate
 > pool includes Anthropic, xAI, DeepSeek and Meta models, which bill separately
 > rather than against Azure consumption. `infra/main.bicep` pins the subset to
