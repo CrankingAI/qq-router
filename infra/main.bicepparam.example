@@ -1,0 +1,53 @@
+// Copy to main.bicepparam and edit. *.bicepparam is gitignored so your real
+// values stay local; only this example is tracked.
+//
+//   az deployment sub create \
+//     --location eastus2 \
+//     --template-file infra/main.bicep \
+//     --parameters infra/main.bicepparam
+
+using './main.bicep'
+
+param namePrefix = 'qq'
+param environment = 'dev'
+param location = 'eastus2'
+
+param routerDeploymentName = 'qq-router'
+param routingMode = 'balanced'
+param routerCapacity = 10
+param routerModelVersion = '2025-11-18'
+
+// The models the router may choose among. Supply at least two: a one-model
+// subset disables automatic failover. Leave this as an empty array to let the
+// router use every model its version supports.
+param routerModels = [
+  {
+    format: 'OpenAI'
+    name: 'gpt-5.6-luna'
+    version: '2026-07-09'
+  }
+  {
+    format: 'OpenAI'
+    name: 'gpt-5.6-terra'
+    version: '2026-07-09'
+  }
+  {
+    format: 'OpenAI'
+    name: 'gpt-5.6-sol'
+    version: '2026-07-09'
+  }
+]
+
+// Object id of the user or service principal that will call the router.
+// Leave empty to skip the role assignment and grant access separately.
+// Find yours with: az ad signed-in-user show --query id -o tsv
+param principalId = ''
+param principalType = 'User'
+
+// Set true to refuse API keys entirely and require Microsoft Entra ID.
+param disableLocalAuth = false
+
+param tags = {
+  owner: 'your-name'
+  'cost-center': 'personal'
+}
