@@ -1,0 +1,151 @@
+"""Configuration resolution, endpoint normalization, and secret handling."""
+
+import stat
+
+import pytest
+
+from qq.config import (
+    DEFAULT_DEPLOYMENT,
+    Settings,
+    config_dir,
+    normalize_endpoint,
+    read_config_file,
+    redact,
+    resolve,
+    write_config_file,
+)
+from qq.errors import ConfigError
+
+RESOURCE = "https://qq-dev-abc123.openai.azure.com"
+
+
+def test_flags_beat_environment_which_beats_file():
+    settings = resolve(
+        env={"QQ_DEPLOYMENT": "from-env", "QQ_ENDPOINT": RESOURCE},
+        file_values={"deployment": "from-file", "model": "from-file-model"},
+        deployment="from-flag",
+    )
+    assert settings.deployment == "from-flag"
+    assert settings.sources["deployment"] == "flag"
+    assert settings.model == "from-file-model"
+    assert settings.sources["model"] == "config file"
+
+
+def test_environment_beats_file():
+    settings = resolve(env={"QQ_DEPLOYMENT": "from-env"}, file_values={"deployment": "from-file"})
+    assert settings.deployment == "from-env"
+    assert settings.sources["deployment"] == "env:QQ_DEPLOYMENT"
+
+
+def test_falls_back_to_azure_openai_variables():
+    settings = resolve(
+        env={"AZURE_OPENAI_ENDPOINT": RESOURCE, "AZURE_OPENAI_API_KEY": "sk-secret"},
+        file_values={},
+    )
+    assert settings.endpoint == RESOURCE
+    assert settings.api_key == "sk-secret"
+    assert settings.sources["api_key"] == "env:AZURE_OPENAI_API_KEY"
+
+
+def test_qq_variables_win_over_azure_openai_variables():
+    settings = resolve(
+        env={"QQ_API_KEY": "preferred", "AZURE_OPENAI_API_KEY": "fallback"}, file_values={}
+    )
+    assert settings.api_key == "preferred"
+
+
+def test_default_deployment_when_nothing_is_set():
+    settings = resolve(env={}, file_values={})
+    assert settings.deployment == DEFAULT_DEPLOYMENT
+    assert settings.sources["deployment"] == "default"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "https://x.openai.azure.com",
+        "https://x.openai.azure.com/",
+        "https://x.openai.azure.com/openai",
+        "https://x.openai.azure.com/openai/v1",
+        "https://x.openai.azure.com/openai/v1/",
+        "x.openai.azure.com",
+    ],
+)
+def test_endpoint_normalizes_to_the_v1_base_url(raw):
+    assert normalize_endpoint(raw) == "https://x.openai.azure.com/openai/v1"
+
+
+def test_endpoint_accepts_the_services_ai_host():
+    got = normalize_endpoint("https://x.services.ai.azure.com/")
+    assert got == "https://x.services.ai.azure.com/openai/v1"
+
+
+def test_empty_endpoint_stays_empty():
+    assert normalize_endpoint("") == ""
+    assert normalize_endpoint("   ") == ""
+
+
+def test_missing_endpoint_raises_with_a_hint():
+    with pytest.raises(ConfigError) as excinfo:
+        Settings().require_endpoint()
+    assert excinfo.value.hint
+
+
+def test_auth_auto_prefers_a_key_when_one_exists():
+    assert Settings(api_key="k").effective_auth == "key"
+    assert Settings().effective_auth == "entra"
+
+
+def test_auth_can_be_forced_to_entra_despite_a_key():
+    assert Settings(api_key="k", auth="entra").effective_auth == "entra"
+
+
+def test_invalid_auth_mode_is_rejected():
+    with pytest.raises(ConfigError):
+        resolve(env={"QQ_AUTH": "magic"}, file_values={})
+
+
+def test_invalid_timeout_is_rejected():
+    with pytest.raises(ConfigError):
+        resolve(env={"QQ_TIMEOUT": "soon"}, file_values={})
+
+
+def test_redact_never_reveals_the_secret_or_its_length():
+    masked = redact("super-secret-key-abcdef")
+    assert "super" not in masked
+    assert "abcdef" not in masked
+    assert len(masked) == len(redact("x"))
+    assert redact(None) == "(not set)"
+
+
+def test_config_file_round_trips(tmp_path, monkeypatch):
+    monkeypatch.setenv("QQ_CONFIG_DIR", str(tmp_path / "qq"))
+    path = write_config_file({"endpoint": RESOURCE, "deployment": "qq-router", "timeout": 30.0})
+    assert read_config_file(path) == {
+        "endpoint": RESOURCE,
+        "deployment": "qq-router",
+        "timeout": 30.0,
+    }
+
+
+def test_config_file_is_owner_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("QQ_CONFIG_DIR", str(tmp_path / "qq"))
+    path = write_config_file({"api_key": "secret"})
+    mode = stat.S_IMODE(path.stat().st_mode)
+    assert mode & (stat.S_IRWXG | stat.S_IRWXO) == 0
+
+
+def test_config_values_with_quotes_survive(tmp_path, monkeypatch):
+    monkeypatch.setenv("QQ_CONFIG_DIR", str(tmp_path / "qq"))
+    tricky = 'has "quotes" and \\ backslash'
+    path = write_config_file({"deployment": tricky})
+    assert read_config_file(path)["deployment"] == tricky
+
+
+def test_missing_config_file_is_not_an_error(tmp_path):
+    assert read_config_file(tmp_path / "nope.toml") == {}
+
+
+def test_config_dir_honours_the_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("QQ_CONFIG_DIR", str(tmp_path / "custom"))
+    assert config_dir() == tmp_path / "custom"
