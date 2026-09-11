@@ -104,12 +104,15 @@ jobs:
       # The gitleaks CLI is MIT-licensed and free. Only the gitleaks-action
       # wrapper requires a paid licence for repositories owned by an
       # organisation, so install the binary directly.
+      # Pinned rather than resolved from the GitHub API: unauthenticated calls
+      # to api.github.com are rate limited per runner IP and returned 403.
+      # Bump this when a new gitleaks release is worth picking up.
       - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
         run: |
           set -euo pipefail
-          tag="$(curl -fsSL https://api.github.com/repos/gitleaks/gitleaks/releases/latest | jq -r .tag_name)"
-          version="${tag#v}"
-          curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/${tag}/gitleaks_${version}_linux_x64.tar.gz" \
+          curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
             | tar -xz gitleaks
           sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
           gitleaks version
