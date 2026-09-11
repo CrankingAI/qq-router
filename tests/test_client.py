@@ -326,6 +326,7 @@ def test_empty_answers_are_rejected():
 def full_answer(**overrides):
     base = {
         "text": "x",
+        "provider": "azure",
         "model": "gpt-5.6-luna-2026-07-09",
         "deployment": "qq-router",
         "latency": 2.63,
@@ -355,13 +356,30 @@ def full_answer(**overrides):
     return Answer(**base)
 
 
-def test_level_one_output_is_unchanged_by_the_new_tiers():
-    """The -v line is load-bearing muscle memory; it must not move."""
+def test_level_one_names_the_provider_first():
+    """With more than one backend, -v has to say which one answered."""
     expected = (
-        "[deployment=qq-router model=gpt-5.6-luna-2026-07-09 latency=2.63s tokens=197in/108out]"
+        "[provider=azure deployment=qq-router model=gpt-5.6-luna-2026-07-09 "
+        "latency=2.63s tokens=197in/108out]"
     )
     assert full_answer().diagnostics(1) == expected
     assert full_answer().diagnostics() == expected
+
+
+def test_level_one_distinguishes_the_two_backends():
+    azure = full_answer().diagnostics(1)
+    openrouter = full_answer(
+        provider="openrouter",
+        deployment="openrouter/auto",
+        model="deepseek/deepseek-v4-flash-0731",
+    ).diagnostics(1)
+    assert "provider=azure" in azure
+    assert "provider=openrouter" in openrouter
+    assert azure != openrouter
+
+
+def test_provider_is_not_repeated_at_higher_tiers():
+    assert "provider=" not in full_answer().diagnostics(2).splitlines()[1]
 
 
 def test_tiers_are_additive_so_lower_lines_never_move():

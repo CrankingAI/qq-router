@@ -50,6 +50,7 @@ class StubBackend:
             latency=0.71,
             input_tokens=9,
             output_tokens=14,
+            provider="azure",
             router="model-router:2025-11-18",
             host="qq-dev-abc.openai.azure.com",
             api=self.settings.effective_api,
@@ -265,3 +266,8 @@ def test_verbose_defaults_to_off(monkeypatch, capsys):
     _, out, err = run(["hi"], monkeypatch, capsys)
     assert err == ""
     assert out.strip()
+
+
+def test_the_v_line_names_the_backend(monkeypatch, capsys):
+    _, _out, err = run(["-v", "hi"], monkeypatch, capsys)
+    assert err.splitlines()[0].startswith("[provider=azure ")

@@ -60,13 +60,13 @@ class Answer:
 
     text: str
     # -v
+    provider: str = ""
     model: str | None = None
     deployment: str = ""
     latency: float = 0.0
     input_tokens: int | None = None
     output_tokens: int | None = None
     # -vv
-    provider: str = ""
     router: str | None = None
     cost: float | None = None
     host: str = ""
@@ -86,7 +86,13 @@ class Answer:
     task_type: str | None = None
 
     def _tier1(self) -> str:
-        parts = [f"deployment={self.deployment or '?'}", f"model={self.model or '?'}"]
+        # Provider leads. Once qq can talk to more than one backend, a line that
+        # does not name the backend is ambiguous, and the deployment name only
+        # implies it by convention.
+        parts = []
+        if self.provider:
+            parts.append(f"provider={self.provider}")
+        parts += [f"deployment={self.deployment or '?'}", f"model={self.model or '?'}"]
         parts.append(f"latency={self.latency:.2f}s")
         if self.input_tokens is not None and self.output_tokens is not None:
             parts.append(f"tokens={self.input_tokens}in/{self.output_tokens}out")
@@ -94,8 +100,6 @@ class Answer:
 
     def _tier2(self) -> str:
         parts = []
-        if self.provider:
-            parts.append(f"provider={self.provider}")
         # Recorded when the CLI was configured. The inference API does not
         # report what a deployment is backed by, so this cannot be derived
         # live; it is labelled as configuration, not observation.

@@ -25,7 +25,7 @@ gh repo list --limit 1000
 ```console
 $ qq --verbose what is a CNAME
 A CNAME record aliases one DNS name to another...
-[deployment=qq-router model=gpt-5.6-luna-2026-07-09 latency=1.97s tokens=196in/83out]
+[provider=azure deployment=qq-router model=gpt-5.6-luna-2026-07-09 latency=1.97s tokens=196in/83out]
 ```
 
 Answers go to stdout, diagnostics to stderr, so `qq` composes in a pipeline.
@@ -332,7 +332,7 @@ the line you already know never shifts.
 ```console
 $ qq -v what is a CNAME
 A CNAME record aliases one DNS name to another...
-[deployment=qq-router model=gpt-5.6-luna-2026-07-09 latency=1.89s tokens=196in/33out]
+[provider=azure deployment=qq-router model=gpt-5.6-luna-2026-07-09 latency=1.89s tokens=196in/33out]
 ```
 
 `deployment` is what `qq` addressed, `model` is what the router actually chose.
@@ -340,7 +340,7 @@ A CNAME record aliases one DNS name to another...
 ```console
 $ qq -vv gh command to clone repo
 gh repo clone OWNER/REPO
-[deployment=qq-router model=gpt-5.6-luna-2026-07-09 latency=2.18s tokens=196in/30out]
+[provider=azure deployment=qq-router model=gpt-5.6-luna-2026-07-09 latency=2.18s tokens=196in/30out]
 [router=model-router:2025-11-18 host=qq-dev-abc.openai.azure.com api=chat auth=entra stream=off request=chatcmpl-EMuZANnJ0Rt]
 ```
 
@@ -351,7 +351,7 @@ rather than a plain model deployment.
 ```console
 $ qq -vvv what is a CNAME
 A CNAME record aliases one DNS name to another...
-[deployment=qq-router model=gpt-5.6-luna-2026-07-09 latency=1.89s tokens=196in/33out]
+[provider=azure deployment=qq-router model=gpt-5.6-luna-2026-07-09 latency=1.89s tokens=196in/33out]
 [router=model-router:2025-11-18 host=qq-dev-abc.openai.azure.com api=chat auth=entra stream=off request=chatcmpl-EMuZDBiHxAr]
 [server pre_inference=43ms engine_ttft=88ms engine_ttlt=315ms engine_tbt=7ms service_ttft=358ms service_ttlt=557ms visible_ttft=315ms]
 [detail replica=gpt56-l-usc-gb3-oai-oe-5b5xdp cached=0 reasoning=0 token_cache=hit tenant=00000000-1111-2222-3333-444444444444 overhead=1.34s]
@@ -363,8 +363,8 @@ acquisition or TLS setup, rather than at the model.
 
 | Level | Shows |
 |---|---|
-| `-v` | routed model, latency, token counts |
-| `-vv` | router identity, host, API surface, auth mode, streaming, request id |
+| `-v` | backend, routed model, latency, token counts |
+| `-vv` | router identity, host, API surface, auth mode, streaming, cost, request id |
 | `-vvv` | server-side timing breakdown, serving replica, cached and reasoning tokens, token cache state, tenant, client overhead |
 
 Every level goes to stderr, so `qq` still composes:
@@ -435,8 +435,8 @@ or stay with one vendor.
 ```console
 $ qq --provider openrouter -vvv what is a CNAME
 A CNAME record aliases one DNS name to another...
-[deployment=openrouter/auto model=anthropic/claude-sonnet-4.5 latency=1.84s tokens=15in/150out]
-[provider=openrouter router=openrouter/auto:low host=openrouter.ai api=chat auth=key stream=off cost=$0.000123 request=gen-abc123]
+[provider=openrouter deployment=openrouter/auto model=anthropic/claude-sonnet-4.5 latency=1.84s tokens=15in/150out]
+[router=openrouter/auto:low host=openrouter.ai api=chat auth=key stream=off cost=$0.000123 request=gen-abc123]
 [detail upstream=Anthropic strategy=auto task=qa_knowledge token_cache=n/a overhead=0.31s]
 ```
 
@@ -466,12 +466,21 @@ costs more; that is what the 100,000 character cap is for.
 `routingMode` is the cost lever. `cost` biases toward cheaper models, `quality`
 toward stronger ones, `balanced` sits between.
 
-How much routing you actually observe depends on how far apart your subset is.
-The default three `gpt-5.6-*` models are close in capability, and in testing
-`balanced` selected `gpt-5.6-luna` for everything from `what does chmod 755
-mean` to a proof of the halting problem. Add a genuinely cheaper model such as
-`gpt-5.4-nano` to `routerModels` if you want the router to have somewhere
-cheaper to go. `--verbose` always shows which model answered.
+The router does move between models, though the three default `gpt-5.6-*`
+models are close enough in capability that you have to look for it. A factual
+lookup and a code-generation question landed on different models:
+
+```console
+$ qq -v who is the pm in france
+[provider=azure deployment=qq-router model=gpt-5.6-luna-2026-07-09 latency=5.11s tokens=197in/208out]
+
+$ qq -v how to write a fibonacci function in rust
+[provider=azure deployment=qq-router model=gpt-5.6-sol-2026-07-09 latency=3.70s tokens=200in/155out]
+```
+
+Add a genuinely cheaper model such as `gpt-5.4-nano` to `routerModels` if you
+want the router somewhere cheaper to go for trivial questions. `-v` always
+shows which model answered.
 
 > **Third-party models are excluded on purpose.** The router's full candidate
 > pool includes Anthropic, xAI, DeepSeek and Meta models, which bill separately
