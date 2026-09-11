@@ -641,8 +641,8 @@ wheels = [
 ]
 
 [[package]]
-name = "opentelemetry-instrumentation-openai-v2"
-version = "2.4b0"
+name = "opentelemetry-instrumentation-genai-openai"
+version = "1.1b0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "opentelemetry-api" },
@@ -650,9 +650,9 @@ dependencies = [
     { name = "opentelemetry-semantic-conventions" },
     { name = "opentelemetry-util-genai" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/07/5f/d034617f70dbf2a92048b0c3536bc1cce10f88adefd43fd75abd51d918b1/opentelemetry_instrumentation_openai_v2-2.4b0.tar.gz", hash = "sha256:571a2febd05b15808d7c777455d5a74c9abe08c694cb9827a98c5b4258f2adf1", size = 190742, upload-time = "2026-05-01T17:41:50.929Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5b/47/eba2a847a0e5b5b385d0a150ffab42ab7fe5aeb02a1e8883f0465ae84a82/opentelemetry_instrumentation_genai_openai-1.1b0.tar.gz", hash = "sha256:26387b64c56670eeb4376339287812dd95e712c11fdf2994ac86f708c748403a", size = 256469, upload-time = "2026-08-20T17:24:34.127Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c3/ed/2e8f3348dfad1dc18c01c2bbc275694e6e6f0c85ccb56257b5516e5af702/opentelemetry_instrumentation_openai_v2-2.4b0-py3-none-any.whl", hash = "sha256:c0c65fe4593fdcb466b55c047138ec71d28a5a3f36c3f0c2c5738343daa31d5c", size = 28027, upload-time = "2026-05-01T17:41:49.768Z" },
+    { url = "https://files.pythonhosted.org/packages/9a/6f/359b5e30c8caa3d25746225c9109db79805bb377bb2dd028355830c6afe3/opentelemetry_instrumentation_genai_openai-1.1b0-py3-none-any.whl", hash = "sha256:057b021840cafb9c11352a3c786d592a9639d59a19b225cc68068db67bb5bf78", size = 32673, upload-time = "2026-08-20T17:24:32.631Z" },
 ]
 
 [[package]]
@@ -918,7 +918,7 @@ dependencies = [
 [package.optional-dependencies]
 otel = [
     { name = "opentelemetry-exporter-otlp-proto-http" },
-    { name = "opentelemetry-instrumentation-openai-v2" },
+    { name = "opentelemetry-instrumentation-genai-openai" },
     { name = "opentelemetry-sdk" },
 ]
 
@@ -932,9 +932,9 @@ dev = [
 requires-dist = [
     { name = "azure-identity", specifier = ">=1.19" },
     { name = "openai", specifier = ">=3.13,<4" },
-    { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'otel'", specifier = ">=1.27" },
-    { name = "opentelemetry-instrumentation-openai-v2", marker = "extra == 'otel'", specifier = ">=2.1b0" },
-    { name = "opentelemetry-sdk", marker = "extra == 'otel'", specifier = ">=1.27" },
+    { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'otel'", specifier = ">=1.30" },
+    { name = "opentelemetry-instrumentation-genai-openai", marker = "extra == 'otel'", specifier = ">=1.1b0" },
+    { name = "opentelemetry-sdk", marker = "extra == 'otel'", specifier = ">=1.30" },
 ]
 provides-extras = ["otel"]
 
