@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Secrets and local configuration — never commit these
+.env
+.env.*
+!.env.example
+*.bicepparam
+!*.bicepparam.example
+secrets.json
+*.key
+*.pem
+
+# Deployment output that can contain endpoints, keys or subscription ids
+outputs.json
+deployment-outputs.json
+azure-outputs.json
+*.deployment.json
+
+# Bicep build artifacts
+infra/**/*.json
+!infra/**/*.example.json
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

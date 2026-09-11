@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Lint and test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install the project
+        run: uv sync --python ${{ matrix.python-version }} --all-extras
+
+      - name: Lint
+        run: uv run --python ${{ matrix.python-version }} ruff check .
+
+      - name: Check formatting
+        run: uv run --python ${{ matrix.python-version }} ruff format --check .
+
+      # No Azure credentials are used anywhere in CI. The Azure client is
+      # stubbed out in tests, so a fork can run the full suite unchanged.
+      - name: Test
+        run: uv run --python ${{ matrix.python-version }} pytest -q
+
+      - name: Smoke-test the console script
+        run: |
+          uv run --python ${{ matrix.python-version }} qq --version
+          uv run --python ${{ matrix.python-version }} qq --help
+
+  bicep:
+    name: Validate Bicep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Bicep
+        run: |
+          curl -sLo bicep https://github.com/Azure/bicep/releases/latest/download/bicep-linux-x64
+          chmod +x bicep
+          sudo mv bicep /usr/local/bin/bicep
+          bicep --version
+
+      - name: Build main.bicep
+        run: bicep build infra/main.bicep --stdout > /dev/null
+
+      - name: Lint with warnings as errors
+        run: bicep lint infra/main.bicep
+
+      - name: Validate the example parameter file
+        run: |
+          cp infra/main.bicepparam.example infra/main.bicepparam
+          bicep build-params infra/main.bicepparam --stdout > /dev/null
+          rm infra/main.bicepparam
+
+  shell:
+    name: Validate shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Syntax check
+        run: for f in scripts/*.sh; do bash -n "$f"; done
+
+      - name: ShellCheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck scripts/*.sh
+
+      - name: Help text is reachable without side effects
+        run: for f in scripts/*.sh; do "$f" --help > /dev/null; done
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
