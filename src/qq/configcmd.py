@@ -85,6 +85,7 @@ def _show() -> int:
         ("auth mode", f"{settings.auth} -> {settings.effective_auth}"),
         ("api surface", f"{settings.api} -> {settings.effective_api}"),
         ("tenant", settings.tenant),
+        ("router", settings.router),
         ("api key", settings.api_key),
         ("timeout", settings.timeout),
     ]

@@ -50,6 +50,17 @@ class StubBackend:
             latency=0.71,
             input_tokens=9,
             output_tokens=14,
+            router="model-router:2025-11-18",
+            host="qq-dev-abc.openai.azure.com",
+            api=self.settings.effective_api,
+            auth=self.settings.effective_auth,
+            stream=stream,
+            request_id="chatcmpl-STUB",
+            server_timings={"service_ttlt_ms": 300, "engine_ttft_ms": 90},
+            replica="replica-7",
+            cached_tokens=0,
+            reasoning_tokens=0,
+            token_cache="hit",
         )
 
 
@@ -215,3 +226,42 @@ def test_default_surface_is_chat_completions(monkeypatch, capsys):
 
     monkeypatch.delenv("QQ_API", raising=False)
     assert resolve().effective_api == "chat"
+
+
+def test_repeated_v_raises_the_tier(monkeypatch, capsys):
+    _, _out, err1 = run(["-v", "hi"], monkeypatch, capsys)
+    _, _out, err2 = run(["-vv", "hi"], monkeypatch, capsys)
+    _, _out, err3 = run(["-vvv", "hi"], monkeypatch, capsys)
+    assert len(err1.strip().splitlines()) == 1
+    assert len(err2.strip().splitlines()) == 2
+    assert len(err3.strip().splitlines()) == 4
+
+
+def test_higher_tiers_keep_the_original_line_first(monkeypatch, capsys):
+    _, _out, err1 = run(["-v", "hi"], monkeypatch, capsys)
+    _, _out, err3 = run(["-vvv", "hi"], monkeypatch, capsys)
+    assert err3.splitlines()[0] == err1.splitlines()[0]
+
+
+def test_every_tier_stays_off_stdout(monkeypatch, capsys):
+    """The whole point of stderr: qq must still compose in a pipeline."""
+    for flag in ("-v", "-vv", "-vvv"):
+        _, out, err = run([flag, "hi"], monkeypatch, capsys)
+        assert out.strip() == "A CNAME record aliases one DNS name to another."
+        assert "[" not in out
+        assert "router=" not in out
+        assert "server " not in out
+        assert "router=model-router:2025-11-18" in err or flag == "-v"
+
+
+def test_no_tier_leaks_the_api_key_to_either_stream(monkeypatch, capsys):
+    for flag in ("-v", "-vv", "-vvv"):
+        _, out, err = run([flag, "hi"], monkeypatch, capsys)
+        assert SECRET not in out
+        assert SECRET not in err
+
+
+def test_verbose_defaults_to_off(monkeypatch, capsys):
+    _, out, err = run(["hi"], monkeypatch, capsys)
+    assert err == ""
+    assert out.strip()

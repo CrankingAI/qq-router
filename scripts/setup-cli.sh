@@ -180,14 +180,22 @@ if [[ -z "$ENDPOINT" ]]; then
   # rejects the call even though the user is logged in.
   TENANT_ID="$(az account show --subscription "$SUBSCRIPTION" --query tenantId -o tsv)"
 
+  DEPLOYMENTS_JSON="$(az cognitiveservices account deployment list \
+    --subscription "$SUBSCRIPTION" \
+    --name "$ACCOUNT_NAME" \
+    --resource-group "$RESOURCE_GROUP" \
+    --only-show-errors -o json)"
+
   if [[ -z "$DEPLOYMENT" ]]; then
-    DEPLOYMENT="$(az cognitiveservices account deployment list \
-      --subscription "$SUBSCRIPTION" \
-      --name "$ACCOUNT_NAME" \
-      --resource-group "$RESOURCE_GROUP" \
-      --only-show-errors -o json \
+    DEPLOYMENT="$(echo "$DEPLOYMENTS_JSON" \
       | jq -r '[ .[] | select(.properties.model.name == "model-router") | .name ] | first // empty')"
   fi
+
+  # Record what the deployment is backed by. The inference API does not report
+  # this, so 'qq -vv' can only show it if we capture it here.
+  ROUTER_DESC="$(echo "$DEPLOYMENTS_JSON" | jq -r --arg d "$DEPLOYMENT" '
+    [ .[] | select(.name == $d) | "\(.properties.model.name):\(.properties.model.version)" ]
+    | first // empty')"
 fi
 
 [[ -n "$DEPLOYMENT" ]] || DEPLOYMENT="qq-router"
@@ -231,6 +239,10 @@ if [[ "$SKIP_CONFIG" != true ]]; then
   if [[ -n "${TENANT_ID:-}" ]]; then
     "$QQ_BIN" config set tenant "$TENANT_ID" >/dev/null
     echo "    Entra tenant: $TENANT_ID"
+  fi
+  if [[ -n "${ROUTER_DESC:-}" ]]; then
+    "$QQ_BIN" config set router "$ROUTER_DESC" >/dev/null
+    echo "    Backed by: $ROUTER_DESC"
   fi
 
   if [[ "$USE_API_KEY" == true ]]; then

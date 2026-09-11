@@ -318,3 +318,160 @@ def test_empty_answers_are_rejected():
     )
     with pytest.raises(QQError):
         backend.ask("hello")
+
+
+# --- tiered diagnostics -----------------------------------------------------
+
+
+def full_answer(**overrides):
+    base = {
+        "text": "x",
+        "model": "gpt-5.6-luna-2026-07-09",
+        "deployment": "qq-router",
+        "latency": 2.63,
+        "input_tokens": 197,
+        "output_tokens": 108,
+        "router": "model-router:2025-11-18",
+        "host": "qq-dev-abc.openai.azure.com",
+        "api": "chat",
+        "auth": "entra",
+        "stream": False,
+        "request_id": "chatcmpl-ABC123",
+        "server_timings": {
+            "pre_inference_ms": 39,
+            "engine_ttft_ms": 99,
+            "engine_ttlt_ms": 183,
+            "service_ttft_ms": 334,
+            "service_ttlt_ms": 431,
+            "user_visible_ttft_ms": 294,
+        },
+        "replica": "gpt56-l-usc-gb3-oai-oe-5b5xdp",
+        "cached_tokens": 0,
+        "reasoning_tokens": 0,
+        "token_cache": "hit",
+        "tenant": "5c369887-aaaa-bbbb-cccc-dddddddddddd",
+    }
+    base.update(overrides)
+    return Answer(**base)
+
+
+def test_level_one_output_is_unchanged_by_the_new_tiers():
+    """The -v line is load-bearing muscle memory; it must not move."""
+    expected = (
+        "[deployment=qq-router model=gpt-5.6-luna-2026-07-09 latency=2.63s tokens=197in/108out]"
+    )
+    assert full_answer().diagnostics(1) == expected
+    assert full_answer().diagnostics() == expected
+
+
+def test_tiers_are_additive_so_lower_lines_never_move():
+    answer = full_answer()
+    one = answer.diagnostics(1).splitlines()
+    two = answer.diagnostics(2).splitlines()
+    three = answer.diagnostics(3).splitlines()
+    assert two[: len(one)] == one
+    assert three[: len(two)] == two
+    assert len(two) == 2
+    assert len(three) == 4
+
+
+def test_level_two_reports_connection_and_request_context():
+    line = full_answer().diagnostics(2).splitlines()[1]
+    assert "router=model-router:2025-11-18" in line
+    assert "host=qq-dev-abc.openai.azure.com" in line
+    assert "api=chat" in line
+    assert "auth=entra" in line
+    assert "stream=off" in line
+    assert "request=chatcmpl-ABC123" in line
+
+
+def test_level_two_marks_an_unknown_router_rather_than_guessing():
+    line = full_answer(router=None).diagnostics(2).splitlines()[1]
+    assert "router=?" in line
+
+
+def test_level_three_reports_server_timings_in_reading_order():
+    line = full_answer().diagnostics(3).splitlines()[2]
+    assert line.startswith("[server ")
+    assert line.index("pre_inference=39ms") < line.index("engine_ttft=99ms")
+    assert line.index("engine_ttft=99ms") < line.index("service_ttft=334ms")
+    assert "visible_ttft=294ms" in line
+
+
+def test_level_three_reports_replica_and_token_detail():
+    line = full_answer().diagnostics(3).splitlines()[3]
+    assert "replica=gpt56-l-usc-gb3-oai-oe-5b5xdp" in line
+    assert "cached=0" in line
+    assert "reasoning=0" in line
+    assert "token_cache=hit" in line
+
+
+def test_client_overhead_separates_local_cost_from_service_cost():
+    answer = full_answer()
+    assert answer.client_overhead == pytest.approx(2.63 - 0.431, abs=0.001)
+    assert "overhead=2.20s" in answer.diagnostics(3)
+
+
+def test_overhead_is_omitted_when_the_service_reported_no_total():
+    answer = full_answer(server_timings={})
+    assert answer.client_overhead is None
+    assert "overhead=" not in answer.diagnostics(3)
+
+
+def test_missing_vendor_extensions_drop_lines_instead_of_printing_blanks():
+    """Azure's routing and latency_checkpoint fields are undocumented extras."""
+    bare = full_answer(
+        server_timings={},
+        replica=None,
+        cached_tokens=None,
+        reasoning_tokens=None,
+        token_cache=None,
+        tenant=None,
+    )
+    assert bare.diagnostics(3).splitlines() == bare.diagnostics(2).splitlines()
+    assert "[server" not in bare.diagnostics(3)
+    assert "[detail" not in bare.diagnostics(3)
+
+
+def test_level_zero_renders_nothing():
+    assert full_answer().diagnostics(0) == ""
+
+
+def test_no_tier_leaks_the_api_key():
+    secret = "azure-key-must-not-appear"
+    backend = FoundryBackend(settings(api_key=secret, api="chat"))
+    answer = full_answer(auth=backend.settings.effective_auth)
+    for level in (1, 2, 3):
+        assert secret not in answer.diagnostics(level)
+
+
+def test_backend_collects_azure_vendor_extensions():
+    """-vvv is only worth having if the extras actually reach the Answer."""
+    backend = FoundryBackend(settings(tenant="tenant-1", router="model-router:2025-11-18"))
+
+    usage = ChatUsage(11, 3)
+    usage.model_extra = {"latency_checkpoint": {"service_ttlt_ms": 431, "engine_ttft_ms": 99}}
+    usage.prompt_tokens_details = types.SimpleNamespace(cached_tokens=7)
+    usage.completion_tokens_details = types.SimpleNamespace(reasoning_tokens=5)
+
+    response = chat_response("42", "gpt-5.6-terra", usage)
+    response.id = "chatcmpl-XYZ"
+    response.model_extra = {"routing": {"serving_endpoint": "replica-7"}}
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            return response
+
+    backend._cached = types.SimpleNamespace(
+        chat=types.SimpleNamespace(completions=FakeCompletions())
+    )
+    answer = backend.ask("hi")
+
+    assert answer.request_id == "chatcmpl-XYZ"
+    assert answer.replica == "replica-7"
+    assert answer.server_timings["service_ttlt_ms"] == 431
+    assert answer.cached_tokens == 7
+    assert answer.reasoning_tokens == 5
+    assert answer.router == "model-router:2025-11-18"
+    assert answer.tenant == "tenant-1"
+    assert answer.api == "chat"

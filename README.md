@@ -214,7 +214,9 @@ az cognitiveservices account keys list -g rg-qq-dev -n <account> --query key1 -o
 ```bash
 qq how do I list all my github repos          # quoting optional
 qq "explain EIP-3009 in two sentences"        # quoting fine too
-qq --verbose what is a CNAME                  # diagnostics on stderr
+qq -v what is a CNAME                         # model and latency on stderr
+qq -vv what is a CNAME                        # plus connection and request context
+qq -vvv what is a CNAME                       # plus server-side timing breakdown
 qq --model gpt-5.6-sol explain TCP slow start # bypass the router
 qq --version
 qq --help
@@ -269,6 +271,7 @@ Precedence, highest first: flags, `QQ_*` environment variables,
 | `QQ_TENANT_ID` | `tenant` | — | Entra tenant owning the resource |
 | `QQ_MODEL` | `model` | — | address a deployment directly |
 | `QQ_API` | `api` | `auto` | `auto`, `chat`, or `responses` |
+| `QQ_ROUTER` | `router` | — | what the deployment is backed by, shown at `-vv` |
 | `QQ_TIMEOUT` | `timeout` | `60` | request timeout in seconds |
 | `QQ_CONFIG_DIR` | — | OS default | override the config directory |
 | `QQ_NO_STREAM` | — | — | disable streaming |
@@ -300,19 +303,60 @@ Both surfaces report the model that actually served the request, which is what
 
 ## Verbose output
 
+`-v` is countable. Each level adds lines without moving the ones below it, so
+the line you already know never shifts.
+
 ```console
-$ qq --verbose what is a CNAME
+$ qq -v what is a CNAME
 A CNAME record aliases one DNS name to another...
-[deployment=qq-router model=gpt-5.6-luna-2026-07-09 latency=1.97s tokens=196in/83out]
+[deployment=qq-router model=gpt-5.6-luna-2026-07-09 latency=1.89s tokens=196in/33out]
 ```
 
 `deployment` is what `qq` addressed, `model` is what the router actually chose.
-This line always goes to stderr, so it never pollutes a pipeline:
+
+```console
+$ qq -vv gh command to clone repo
+gh repo clone OWNER/REPO
+[deployment=qq-router model=gpt-5.6-luna-2026-07-09 latency=2.18s tokens=196in/30out]
+[router=model-router:2025-11-18 host=qq-dev-abc.openai.azure.com api=chat auth=entra stream=off request=chatcmpl-EMuZANnJ0Rt]
+```
+
+`-vv` answers "what am I actually talking to". `router` is the model backing
+your deployment, which is how you confirm you are on Microsoft's Model Router
+rather than a plain model deployment.
+
+```console
+$ qq -vvv what is a CNAME
+A CNAME record aliases one DNS name to another...
+[deployment=qq-router model=gpt-5.6-luna-2026-07-09 latency=1.89s tokens=196in/33out]
+[router=model-router:2025-11-18 host=qq-dev-abc.openai.azure.com api=chat auth=entra stream=off request=chatcmpl-EMuZDBiHxAr]
+[server pre_inference=43ms engine_ttft=88ms engine_ttlt=315ms engine_tbt=7ms service_ttft=358ms service_ttlt=557ms visible_ttft=315ms]
+[detail replica=gpt56-l-usc-gb3-oai-oe-5b5xdp cached=0 reasoning=0 token_cache=hit tenant=5c369887-... overhead=1.34s]
+```
+
+`-vvv` is for "why did that feel slow". `overhead` is wall time the service did
+not account for, so a large value points at the local side, usually token
+acquisition or TLS setup, rather than at the model.
+
+| Level | Shows |
+|---|---|
+| `-v` | routed model, latency, token counts |
+| `-vv` | router identity, host, API surface, auth mode, streaming, request id |
+| `-vvv` | server-side timing breakdown, serving replica, cached and reasoning tokens, token cache state, tenant, client overhead |
+
+Every level goes to stderr, so `qq` still composes:
 
 ```bash
-qq --verbose ... 2>/dev/null   # answer only
-qq --verbose ... >/dev/null    # diagnostics only
+qq -vvv ... 2>/dev/null   # answer only
+qq -vvv ... >/dev/null    # diagnostics only
 ```
+
+Two caveats. `router` is recorded when `setup-cli.sh` runs, because the
+inference API does not report what a deployment is backed by; it reflects setup
+time, and shows `router=?` if never recorded. The `server` and `replica` fields
+come from `routing` and `latency_checkpoint`, which are Azure extensions rather
+than part of the OpenAI schema, so those lines are omitted entirely if a future
+service update stops returning them.
 
 ## Cost
 

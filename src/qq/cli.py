@@ -35,6 +35,7 @@ examples:
   git diff | qq summarize this
   cat error.txt | qq explain this error
   qq --verbose what is a CNAME
+  qq -vvv what is a CNAME          # full server-side timing breakdown
 
 subcommands:
   qq config [show|set KEY VALUE|unset KEY|path]
@@ -54,8 +55,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-v",
         "--verbose",
-        action="store_true",
-        help="print routing diagnostics to stderr (never to stdout)",
+        action="count",
+        default=0,
+        help=(
+            "routing diagnostics on stderr, never stdout. Repeat for more: "
+            "-v model and latency, -vv connection and request context, "
+            "-vvv server-side timing breakdown"
+        ),
     )
     parser.add_argument(
         "-m",
@@ -199,7 +205,7 @@ def run_query(args: argparse.Namespace, stdin_text: str | None) -> int:
         _out(answer.text + "\n")
 
     if args.verbose:
-        _err(answer.diagnostics() + "\n")
+        _err(answer.diagnostics(args.verbose) + "\n")
     return EXIT_OK
 
 

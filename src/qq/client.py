@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .config import Settings
@@ -50,24 +50,129 @@ ENTRA_SCOPE = "https://ai.azure.com/.default"
 API_SURFACES = ("auto", "chat", "responses")
 
 
+#: Server-side timing fields Azure returns, in the order worth reading them,
+#: mapped to the short labels used in the -vvv output.
+SERVER_TIMING_FIELDS = (
+    ("pre_inference_ms", "pre_inference"),
+    ("engine_ttft_ms", "engine_ttft"),
+    ("engine_ttlt_ms", "engine_ttlt"),
+    ("engine_tbt_ms", "engine_tbt"),
+    ("service_ttft_ms", "service_ttft"),
+    ("service_ttlt_ms", "service_ttlt"),
+    ("user_visible_ttft_ms", "visible_ttft"),
+)
+
+
 @dataclass
 class Answer:
-    """One completed answer, plus what the diagnostics line needs."""
+    """One completed answer, plus everything the diagnostics tiers can show.
+
+    Fields are grouped by the verbosity level that reveals them. Anything the
+    service did not return stays ``None`` and is omitted rather than printed
+    as a placeholder, because a diagnostics line that invents fields is worse
+    than one that is short.
+    """
 
     text: str
+    # -v
     model: str | None = None
     deployment: str = ""
     latency: float = 0.0
     input_tokens: int | None = None
     output_tokens: int | None = None
+    # -vv
+    router: str | None = None
+    host: str = ""
+    api: str = ""
+    auth: str = ""
+    stream: bool = False
+    request_id: str | None = None
+    # -vvv
+    server_timings: dict[str, int] = field(default_factory=dict)
+    replica: str | None = None
+    cached_tokens: int | None = None
+    reasoning_tokens: int | None = None
+    token_cache: str | None = None
+    tenant: str | None = None
 
-    def diagnostics(self) -> str:
-        """Render the ``--verbose`` line. Contains no secrets by construction."""
+    def _tier1(self) -> str:
         parts = [f"deployment={self.deployment or '?'}", f"model={self.model or '?'}"]
         parts.append(f"latency={self.latency:.2f}s")
         if self.input_tokens is not None and self.output_tokens is not None:
             parts.append(f"tokens={self.input_tokens}in/{self.output_tokens}out")
         return "[" + " ".join(parts) + "]"
+
+    def _tier2(self) -> str:
+        parts = []
+        # Recorded when the CLI was configured. The inference API does not
+        # report what a deployment is backed by, so this cannot be derived
+        # live; it is labelled as configuration, not observation.
+        parts.append(f"router={self.router}" if self.router else "router=?")
+        if self.host:
+            parts.append(f"host={self.host}")
+        parts.append(f"api={self.api or '?'}")
+        parts.append(f"auth={self.auth or '?'}")
+        parts.append(f"stream={'on' if self.stream else 'off'}")
+        if self.request_id:
+            parts.append(f"request={self.request_id}")
+        return "[" + " ".join(parts) + "]"
+
+    def _tier3(self) -> list[str]:
+        lines = []
+        if self.server_timings:
+            timing = [
+                f"{label}={self.server_timings[key]}ms"
+                for key, label in SERVER_TIMING_FIELDS
+                if key in self.server_timings
+            ]
+            if timing:
+                lines.append("[server " + " ".join(timing) + "]")
+
+        detail = []
+        if self.replica:
+            detail.append(f"replica={self.replica}")
+        if self.cached_tokens is not None:
+            detail.append(f"cached={self.cached_tokens}")
+        if self.reasoning_tokens is not None:
+            detail.append(f"reasoning={self.reasoning_tokens}")
+        if self.token_cache:
+            detail.append(f"token_cache={self.token_cache}")
+        if self.tenant:
+            detail.append(f"tenant={self.tenant}")
+        overhead = self.client_overhead
+        if overhead is not None:
+            detail.append(f"overhead={overhead:.2f}s")
+        if detail:
+            lines.append("[detail " + " ".join(detail) + "]")
+        return lines
+
+    @property
+    def client_overhead(self) -> float | None:
+        """Wall time not accounted for by the service's own total.
+
+        Large values point at the local side: token acquisition, TLS setup, or
+        a slow network path rather than a slow model.
+        """
+        total_ms = self.server_timings.get("service_ttlt_ms")
+        if total_ms is None:
+            return None
+        return max(0.0, self.latency - (total_ms / 1000.0))
+
+    def diagnostics(self, level: int = 1) -> str:
+        """Render the diagnostics for a verbosity level.
+
+        Levels are additive: level 2 emits the level 1 line unchanged and adds
+        to it, so the familiar line never moves. Contains no secrets by
+        construction; the API key is never a field here.
+        """
+        if level <= 0:
+            return ""
+        lines = [self._tier1()]
+        if level >= 2:
+            lines.append(self._tier2())
+        if level >= 3:
+            lines.extend(self._tier3())
+        return "\n".join(lines)
 
 
 def _attr(obj: Any, name: str) -> Any:
@@ -76,6 +181,61 @@ def _attr(obj: Any, name: str) -> Any:
     if value is None and isinstance(obj, dict):
         value = obj.get(name)
     return value
+
+
+def _extra(obj: Any, name: str) -> Any:
+    """Read a vendor extension the OpenAI schema does not define.
+
+    Azure attaches ``routing`` and ``latency_checkpoint`` to responses. These
+    are not part of the OpenAI schema, so the SDK parks them in ``model_extra``
+    rather than exposing them as attributes. They are undocumented and may
+    disappear, so every read is best-effort and every caller tolerates None.
+    """
+    if obj is None:
+        return None
+    extra = getattr(obj, "model_extra", None)
+    if isinstance(extra, dict) and name in extra:
+        return extra[name]
+    if isinstance(obj, dict):
+        return obj.get(name)
+    return getattr(obj, name, None)
+
+
+def _merge_meta(meta: dict[str, Any], response: Any, usage: Any = None) -> None:
+    """Fold whatever diagnostics a response or stream chunk carries into meta."""
+    if response is None:
+        return
+    request_id = _attr(response, "id")
+    if request_id:
+        meta["request_id"] = request_id
+
+    routing = _extra(response, "routing")
+    if isinstance(routing, dict) and routing.get("serving_endpoint"):
+        meta["replica"] = routing["serving_endpoint"]
+
+    # Non-streaming puts the timings under usage; streaming puts them at the
+    # top level of the final chunk. Accept either.
+    for source in (usage, response):
+        checkpoint = _extra(source, "latency_checkpoint")
+        if isinstance(checkpoint, dict):
+            meta.setdefault("server_timings", {}).update(
+                {k: v for k, v in checkpoint.items() if isinstance(v, (int, float))}
+            )
+
+    if usage is not None:
+        prompt_details = _attr(usage, "prompt_tokens_details") or _attr(
+            usage, "input_tokens_details"
+        )
+        cached = _attr(prompt_details, "cached_tokens")
+        if cached is not None:
+            meta["cached_tokens"] = cached
+
+        completion_details = _attr(usage, "completion_tokens_details") or _attr(
+            usage, "output_tokens_details"
+        )
+        reasoning = _attr(completion_details, "reasoning_tokens")
+        if reasoning is not None:
+            meta["reasoning_tokens"] = reasoning
 
 
 def extract_responses_text(response: Any) -> str:
@@ -162,7 +322,11 @@ def build_credential(tenant: str | None = None) -> Any:
     )
 
 
-def entra_token_provider(scope: str = ENTRA_SCOPE, tenant: str | None = None) -> Callable[[], str]:
+def entra_token_provider(
+    scope: str = ENTRA_SCOPE,
+    tenant: str | None = None,
+    stats: dict[str, Any] | None = None,
+) -> Callable[[], str]:
     """Build a bearer-token provider backed by Entra ID.
 
     Returned uncalled to the OpenAI client, which invokes it per request. A
@@ -178,11 +342,15 @@ def entra_token_provider(scope: str = ENTRA_SCOPE, tenant: str | None = None) ->
         nonlocal credential
         cached = tokencache.load(key)
         if cached:
+            if stats is not None:
+                stats["token_cache"] = "hit"
             return cached
         if credential is None:
             credential = build_credential(tenant)
         access = credential.get_token(scope)
         tokencache.store(key, access.token, access.expires_on)
+        if stats is not None:
+            stats["token_cache"] = "off" if tokencache.disabled() else "miss"
         return access.token
 
     return provider
@@ -258,6 +426,7 @@ class FoundryBackend:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._cached: Any = None
+        self._auth_stats: dict[str, Any] = {}
 
     # -- wiring -------------------------------------------------------------
 
@@ -284,7 +453,7 @@ class FoundryBackend:
         else:
             # Passed uncalled on purpose: the SDK invokes it per request, which
             # keeps the bearer token fresh.
-            credential = entra_token_provider(tenant=self.settings.tenant)
+            credential = entra_token_provider(tenant=self.settings.tenant, stats=self._auth_stats)
 
         self._cached = OpenAI(
             base_url=base_url,
@@ -304,6 +473,15 @@ class FoundryBackend:
         """The API surface this call will use."""
         return self.settings.effective_api
 
+    @property
+    def host(self) -> str:
+        """Hostname of the configured endpoint, for diagnostics."""
+        from urllib.parse import urlparse
+
+        if not self.settings.endpoint:
+            return ""
+        return urlparse(self.settings.base_url).netloc
+
     # -- public API ---------------------------------------------------------
 
     def ask(
@@ -321,13 +499,16 @@ class FoundryBackend:
         """
         client = self._build_client()
         target = self.target
+        meta: dict[str, Any] = {}
         started = time.monotonic()
 
         try:
             if self.surface == "responses":
-                text, model, usage = self._via_responses(client, target, prompt, stream, on_delta)
+                text, model, usage = self._via_responses(
+                    client, target, prompt, stream, on_delta, meta
+                )
             else:
-                text, model, usage = self._via_chat(client, target, prompt, stream, on_delta)
+                text, model, usage = self._via_chat(client, target, prompt, stream, on_delta, meta)
         except QQError:
             raise
         except Exception as exc:
@@ -345,6 +526,18 @@ class FoundryBackend:
             latency=time.monotonic() - started,
             input_tokens=usage[0],
             output_tokens=usage[1],
+            router=self.settings.router,
+            host=self.host,
+            api=self.surface,
+            auth=self.settings.effective_auth,
+            stream=stream,
+            request_id=meta.get("request_id"),
+            server_timings=meta.get("server_timings", {}),
+            replica=meta.get("replica"),
+            cached_tokens=meta.get("cached_tokens"),
+            reasoning_tokens=meta.get("reasoning_tokens"),
+            token_cache=self._auth_stats.get("token_cache"),
+            tenant=self.settings.tenant,
         )
 
     # -- Chat Completions ---------------------------------------------------
@@ -356,6 +549,7 @@ class FoundryBackend:
         prompt: str,
         stream: bool,
         on_delta: Callable[[str], None] | None,
+        meta: dict[str, Any],
     ) -> tuple[str, str | None, tuple[int | None, int | None]]:
         messages = [
             {"role": "system", "content": SYSTEM_INSTRUCTION},
@@ -363,6 +557,7 @@ class FoundryBackend:
         ]
         if not stream:
             response = client.chat.completions.create(model=target, messages=messages)
+            _merge_meta(meta, response, _attr(response, "usage"))
             return extract_chat_text(response), _attr(response, "model"), _chat_usage(response)
 
         chunks: list[str] = []
@@ -376,7 +571,9 @@ class FoundryBackend:
         )
         for event in events:
             model = _attr(event, "model") or model
-            if _attr(event, "usage") is not None:
+            event_usage = _attr(event, "usage")
+            _merge_meta(meta, event, event_usage)
+            if event_usage is not None:
                 usage = _chat_usage(event)
             for choice in _attr(event, "choices") or []:
                 delta = _attr(choice, "delta")
@@ -396,11 +593,13 @@ class FoundryBackend:
         prompt: str,
         stream: bool,
         on_delta: Callable[[str], None] | None,
+        meta: dict[str, Any],
     ) -> tuple[str, str | None, tuple[int | None, int | None]]:
         if not stream:
             response = client.responses.create(
                 model=target, instructions=SYSTEM_INSTRUCTION, input=prompt
             )
+            _merge_meta(meta, response, _attr(response, "usage"))
             return (
                 extract_responses_text(response),
                 _attr(response, "model"),
@@ -424,6 +623,8 @@ class FoundryBackend:
                 final = _attr(event, "response")
 
         text = "".join(chunks).strip()
+        if final is not None:
+            _merge_meta(meta, final, _attr(final, "usage"))
         if not text and final is not None:
             text = extract_responses_text(final)
         model = _attr(final, "model") if final is not None else None

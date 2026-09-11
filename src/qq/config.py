@@ -36,6 +36,7 @@ SETTABLE_KEYS = (
     "tenant",
     "model",
     "api",
+    "router",
     "timeout",
 )
 
@@ -159,6 +160,10 @@ class Settings:
     api_key: str | None = None
     auth: str = "auto"
     tenant: str | None = None
+    #: What the deployment is backed by, e.g. "model-router:2025-11-18".
+    #: Recorded by scripts/setup-cli.sh: the inference API does not report it,
+    #: so it reflects configuration time rather than live state.
+    router: str | None = None
     model: str | None = None
     api: str = "auto"
     timeout: float = DEFAULT_TIMEOUT
@@ -213,6 +218,7 @@ def resolve(
     auth: str | None = None,
     tenant: str | None = None,
     api: str | None = None,
+    router: str | None = None,
     timeout: float | None = None,
 ) -> Settings:
     """Resolve settings from flags, environment, and file values.
@@ -246,6 +252,7 @@ def resolve(
     resolved_tenant = pick("tenant", tenant, ("QQ_TENANT_ID", "AZURE_TENANT_ID"))
     resolved_model = pick("model", model, ("QQ_MODEL",))
     resolved_api = pick("api", api, ("QQ_API",))
+    resolved_router = pick("router", router, ("QQ_ROUTER",))
     resolved_timeout = pick("timeout", timeout, ("QQ_TIMEOUT",))
 
     auth_mode = str(resolved_auth or "auto").lower()
@@ -275,6 +282,7 @@ def resolve(
         tenant=str(resolved_tenant) if resolved_tenant else None,
         model=str(resolved_model) if resolved_model else None,
         api=api_surface,
+        router=str(resolved_router) if resolved_router else None,
         timeout=timeout_value,
         sources=sources,
     )
