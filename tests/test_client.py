@@ -349,7 +349,7 @@ def full_answer(**overrides):
         "cached_tokens": 0,
         "reasoning_tokens": 0,
         "token_cache": "hit",
-        "tenant": "5c369887-aaaa-bbbb-cccc-dddddddddddd",
+        "tenant": "00000000-1111-2222-3333-444444444444",
     }
     base.update(overrides)
     return Answer(**base)

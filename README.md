@@ -354,7 +354,7 @@ A CNAME record aliases one DNS name to another...
 [deployment=qq-router model=gpt-5.6-luna-2026-07-09 latency=1.89s tokens=196in/33out]
 [router=model-router:2025-11-18 host=qq-dev-abc.openai.azure.com api=chat auth=entra stream=off request=chatcmpl-EMuZDBiHxAr]
 [server pre_inference=43ms engine_ttft=88ms engine_ttlt=315ms engine_tbt=7ms service_ttft=358ms service_ttlt=557ms visible_ttft=315ms]
-[detail replica=gpt56-l-usc-gb3-oai-oe-5b5xdp cached=0 reasoning=0 token_cache=hit tenant=5c369887-... overhead=1.34s]
+[detail replica=gpt56-l-usc-gb3-oai-oe-5b5xdp cached=0 reasoning=0 token_cache=hit tenant=00000000-1111-2222-3333-444444444444 overhead=1.34s]
 ```
 
 `-vvv` is for "why did that feel slow". `overhead` is wall time the service did
