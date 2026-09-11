@@ -9,9 +9,12 @@
 
 **Ask a quick question from your terminal. Get a short answer back.**
 
-`qq` is for the questions that do not deserve a browser tab. Azure AI Foundry's
-Model Router picks a cheap model for easy questions and a stronger one for hard
-ones, so you do not have to think about which model to use.
+`qq` is for the questions that do not deserve a browser tab. A model router
+picks a cheap model for easy questions and a stronger one for hard ones, so you
+do not have to think about which model to use.
+
+Two backends, same idea: **Azure AI Foundry Model Router** (the default) and
+**OpenRouter**.
 
 ```console
 $ qq how do I list all my github repos
@@ -36,22 +39,33 @@ no proxy. The CLI calls Azure directly.
 flowchart TD
     T["terminal"] --> Q["qq CLI<br/>(local Python tool)"]
     Q -->|"HTTPS + Entra ID or API key"| F["Azure AI Foundry<br/>/openai/v1"]
-    F --> R["model-router deployment<br/>mode: balanced"]
-    R -->|simple question| L["gpt-5.6-luna<br/>fast, inexpensive"]
-    R -->|moderate| TE["gpt-5.6-terra"]
-    R -->|hard question| S["gpt-5.6-sol<br/>strongest"]
+    Q -.->|"HTTPS + API key"| O["OpenRouter<br/>/api/v1"]
 
-    subgraph Azure["Azure subscription (all of it, provisioned by Bicep)"]
+    F --> R["model-router deployment<br/>mode: balanced"]
+    R -->|simple question| L["gpt-5.6-luna"]
+    R -->|moderate| TE["gpt-5.6-terra"]
+    R -->|hard question| S["gpt-5.6-sol"]
+
+    O --> A["openrouter/auto<br/>cost_tier"]
+    A --> M["whichever model wins<br/>for the task type"]
+
+    subgraph Azure["Azure subscription (provisioned by Bicep)"]
         F
         R
         L
         TE
         S
     end
+    subgraph OR["OpenRouter account (nothing to provision)"]
+        O
+        A
+        M
+    end
 ```
 
-The whole server side is one `Microsoft.CognitiveServices/accounts` resource of
-kind `AIServices` plus one `model-router` deployment on it.
+On Azure the whole server side is one `Microsoft.CognitiveServices/accounts`
+resource of kind `AIServices` plus one `model-router` deployment on it. On
+OpenRouter there is nothing to provision at all: an API key is the entire setup.
 
 ## Prerequisites
 
@@ -271,7 +285,12 @@ Precedence, highest first: flags, `QQ_*` environment variables,
 | `QQ_TENANT_ID` | `tenant` | — | Entra tenant owning the resource |
 | `QQ_MODEL` | `model` | — | address a deployment directly |
 | `QQ_API` | `api` | `auto` | `auto`, `chat`, or `responses` |
-| `QQ_ROUTER` | `router` | — | what the deployment is backed by, shown at `-vv` |
+| `QQ_ROUTER` | `router` | — | what the Azure deployment is backed by, shown at `-vv` |
+| `QQ_PROVIDER` | `provider` | `azure` | `azure` or `openrouter` |
+| `QQ_OPENROUTER_API_KEY` | `openrouter_api_key` | — | OpenRouter key; `OPENROUTER_API_KEY` also works |
+| — | `openrouter_model` | `openrouter/auto` | OpenRouter model slug |
+| `QQ_COST_TIER` | `cost_tier` | — | `low`, `medium`, `high`, `xhigh`, `max` |
+| `QQ_ALLOWED_MODELS` | `allowed_models` | — | comma-separated patterns the auto-router may pick from |
 | `QQ_TIMEOUT` | `timeout` | `60` | request timeout in seconds |
 | `QQ_CONFIG_DIR` | — | OS default | override the config directory |
 | `QQ_NO_STREAM` | — | — | disable streaming |
@@ -283,6 +302,10 @@ an existing Azure setup works with no extra configuration.
 
 The config file lives at `~/.config/qq/config.toml` on macOS and Linux
 (`%APPDATA%\qq\config.toml` on Windows), mode `0600` in a `0700` directory.
+
+Each provider keeps its own persisted keys, so both can be configured at once
+and `QQ_PROVIDER=openrouter qq ...` never reaches for an Azure endpoint or an
+Azure deployment name.
 
 ### Which API surface
 
@@ -357,6 +380,76 @@ time, and shows `router=?` if never recorded. The `server` and `replica` fields
 come from `routing` and `latency_checkpoint`, which are Azure extensions rather
 than part of the OpenAI schema, so those lines are omitted entirely if a future
 service update stops returning them.
+
+## OpenRouter
+
+[OpenRouter](https://openrouter.ai) is an aggregator with its own auto-router,
+which makes it a close analogue of Azure's Model Router. It needs no
+infrastructure: a key is the whole setup.
+
+```bash
+qq config set provider openrouter
+qq config set openrouter_api_key '<key>'    # from https://openrouter.ai/keys
+qq doctor
+qq what is the gh cli command to list all repos
+```
+
+Or per-invocation, leaving your Azure setup as the default:
+
+```bash
+QQ_PROVIDER=openrouter qq explain EIP-3009
+qq --provider openrouter --cost-tier low what is a CNAME
+```
+
+### How the two map
+
+| Azure AI Foundry | OpenRouter |
+|---|---|
+| `model-router` deployment | the `openrouter/auto` model |
+| `routingMode` (`balanced`/`cost`/`quality`) | `cost_tier` (`low`…`max`) |
+| `routerModels` subset in Bicep | `allowed_models` patterns |
+| `response.model` | `response.model` |
+| Entra ID or API key | API key only |
+
+They choose differently. Azure judges how hard the question is. OpenRouter
+classifies the prompt into one of roughly thirty task types, then ranks
+candidates by what the OpenRouter community actually spent on that task type
+over the previous week, filtered by your cost tier.
+
+`cost_tier` is a percentile *band*, not a ceiling, so `low` also excludes models
+cheaper than the band. Setting nothing routes roughly as if you asked for `low`.
+
+### Restricting what it may pick
+
+```bash
+qq config set cost_tier low
+qq config set allowed_models 'openai/*,anthropic/*,google/gemini-2.5-flash*'
+```
+
+Patterns accept wildcards. This is the equivalent of pinning `routerModels` in
+the Bicep, and it is the knob to reach for if you want to keep spend predictable
+or stay with one vendor.
+
+### Seeing what it did
+
+```console
+$ qq --provider openrouter -vvv what is a CNAME
+A CNAME record aliases one DNS name to another...
+[deployment=openrouter/auto model=anthropic/claude-sonnet-4.5 latency=1.84s tokens=15in/150out]
+[provider=openrouter router=openrouter/auto:low host=openrouter.ai api=chat auth=key stream=off cost=$0.000123 request=gen-abc123]
+[detail upstream=Anthropic strategy=auto task=qa_knowledge token_cache=n/a overhead=0.31s]
+```
+
+OpenRouter reports the real charge for each request, so `cost` at `-vv` is the
+actual money spent, not an estimate. `upstream` and `task` come from an opt-in
+metadata header that `qq` sends for you.
+
+### Billing
+
+**OpenRouter is billed by OpenRouter, not against Azure credits.** That is the
+main reason it is not the default. A negative balance returns `402` even on
+free models. Free model variants carry a `:free` suffix and are capped at 50
+requests a day until you have bought at least 10 dollars of credit, then 1000.
 
 ## Cost
 

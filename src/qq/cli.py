@@ -77,6 +77,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="force an authentication mode (default: auto)",
     )
     parser.add_argument(
+        "--provider",
+        choices=("azure", "openrouter"),
+        help="which backend to ask (default: azure)",
+    )
+    parser.add_argument(
+        "--cost-tier",
+        dest="cost_tier",
+        choices=("low", "medium", "high", "xhigh", "max"),
+        help="OpenRouter cost tier; the rough analogue of Azure's routing mode",
+    )
+    parser.add_argument(
         "--api",
         choices=("auto", "chat", "responses"),
         help=(
@@ -169,7 +180,7 @@ def _should_stream(explicit: bool | None) -> bool:
 
 
 def run_query(args: argparse.Namespace, stdin_text: str | None) -> int:
-    from .client import FoundryBackend
+    from .client import build_backend
     from .config import resolve
 
     typed = join_args(args.words)
@@ -191,9 +202,11 @@ def run_query(args: argparse.Namespace, stdin_text: str | None) -> int:
         auth=args.auth,
         tenant=args.tenant,
         api=args.api,
+        provider=args.provider,
+        cost_tier=args.cost_tier,
         timeout=args.timeout,
     )
-    backend = FoundryBackend(settings)
+    backend = build_backend(settings)
 
     streaming = _should_stream(args.stream)
     if streaming:

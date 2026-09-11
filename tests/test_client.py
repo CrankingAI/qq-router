@@ -9,9 +9,9 @@ import types
 import openai
 import pytest
 
+from qq.azure import AzureFoundryBackend as FoundryBackend
 from qq.client import (
     Answer,
-    FoundryBackend,
     extract_chat_text,
     extract_responses_text,
     translate_error,

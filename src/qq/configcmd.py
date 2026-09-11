@@ -78,6 +78,7 @@ def _show() -> int:
     print(f"config file: {path}{'' if path.exists() else '  (not created yet)'}")
     print()
     rows = [
+        ("provider", settings.provider),
         ("endpoint", settings.endpoint),
         ("base url", settings.base_url),
         ("deployment", settings.deployment),
@@ -86,16 +87,24 @@ def _show() -> int:
         ("api surface", f"{settings.api} -> {settings.effective_api}"),
         ("tenant", settings.tenant),
         ("router", settings.router),
-        ("api key", settings.api_key),
+        ("cost tier", settings.cost_tier),
+        ("allowed models", settings.allowed_models),
+        (
+            "openrouter key" if settings.effective_provider == "openrouter" else "api key",
+            settings.api_key,
+        ),
         ("timeout", settings.timeout),
     ]
     width = max(len(name) for name, _ in rows)
     for name, value in rows:
         key = {
             "api key": "api_key",
+            "openrouter key": "openrouter_api_key",
             "model override": "model",
             "base url": "endpoint",
             "api surface": "api",
+            "cost tier": "cost_tier",
+            "allowed models": "allowed_models",
         }.get(name, name)
         source = settings.sources.get(key, "")
         suffix = f"   [{source}]" if source and source != "default" else ""

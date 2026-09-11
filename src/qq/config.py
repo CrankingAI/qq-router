@@ -27,21 +27,38 @@ from .errors import ConfigError
 DEFAULT_DEPLOYMENT = "qq-router"
 DEFAULT_TIMEOUT = 60.0
 
+#: Backends qq can talk to. Both expose an OpenAI-compatible API.
+PROVIDERS = ("azure", "openrouter")
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+#: OpenRouter's auto-router, the closest equivalent to Azure's model-router.
+OPENROUTER_DEFAULT_MODEL = "openrouter/auto"
+
+#: OpenRouter cost tiers. These are percentile bands rather than ceilings, so a
+#: tier excludes models cheaper than the band as well as models above it.
+COST_TIERS = ("low", "medium", "high", "xhigh", "max")
+
 #: Config keys a user may set via ``qq config set``.
 SETTABLE_KEYS = (
+    "provider",
     "endpoint",
     "deployment",
     "auth",
     "api_key",
+    "openrouter_api_key",
+    "openrouter_model",
     "tenant",
     "model",
     "api",
     "router",
+    "cost_tier",
+    "allowed_models",
     "timeout",
 )
 
 #: Keys whose values must never be printed.
-SECRET_KEYS = ("api_key",)
+SECRET_KEYS = ("api_key", "openrouter_api_key")
 
 AUTH_MODES = ("auto", "entra", "key")
 
@@ -155,27 +172,55 @@ def redact(value: str | None) -> str:
 class Settings:
     """Fully resolved runtime settings."""
 
+    provider: str = "azure"
     endpoint: str = ""
     deployment: str = DEFAULT_DEPLOYMENT
     api_key: str | None = None
     auth: str = "auto"
     tenant: str | None = None
-    #: What the deployment is backed by, e.g. "model-router:2025-11-18".
+    #: What the Azure deployment is backed by, e.g. "model-router:2025-11-18".
     #: Recorded by scripts/setup-cli.sh: the inference API does not report it,
     #: so it reflects configuration time rather than live state.
     router: str | None = None
     model: str | None = None
+    #: OpenRouter cost tier, the rough analogue of Azure's routing mode.
+    cost_tier: str | None = None
+    #: Comma-separated patterns restricting what the auto-router may choose.
+    allowed_models: str | None = None
     api: str = "auto"
     timeout: float = DEFAULT_TIMEOUT
     sources: dict[str, str] = field(default_factory=dict)
 
     @property
+    def effective_provider(self) -> str:
+        return self.provider if self.provider in PROVIDERS else "azure"
+
+    @property
     def base_url(self) -> str:
+        """The URL the OpenAI client is pointed at.
+
+        OpenRouter publishes one fixed base URL, so it needs no configuration
+        and never gets the Azure ``/openai/v1`` suffix appended.
+        """
+        if self.effective_provider == "openrouter":
+            return OPENROUTER_BASE_URL
         return normalize_endpoint(self.endpoint) if self.endpoint else ""
 
     @property
+    def allowed_model_list(self) -> list[str]:
+        if not self.allowed_models:
+            return []
+        return [item.strip() for item in self.allowed_models.split(",") if item.strip()]
+
+    @property
     def effective_auth(self) -> str:
-        """Resolve ``auto`` into the mode that will actually be used."""
+        """Resolve ``auto`` into the mode that will actually be used.
+
+        OpenRouter only understands bearer API keys; there is no Entra path, so
+        the mode is fixed rather than inferred.
+        """
+        if self.effective_provider == "openrouter":
+            return "key"
         if self.auth == "key":
             return "key"
         if self.auth == "entra":
@@ -192,6 +237,8 @@ class Settings:
         return "responses" if self.api == "responses" else "chat"
 
     def require_endpoint(self) -> str:
+        if self.effective_provider == "openrouter":
+            return self.base_url
         if not self.endpoint:
             raise ConfigError(
                 "no endpoint configured",
@@ -219,6 +266,8 @@ def resolve(
     tenant: str | None = None,
     api: str | None = None,
     router: str | None = None,
+    provider: str | None = None,
+    cost_tier: str | None = None,
     timeout: float | None = None,
 ) -> Settings:
     """Resolve settings from flags, environment, and file values.
@@ -230,7 +279,16 @@ def resolve(
     values = dict(file_values if file_values is not None else read_config_file())
     sources: dict[str, str] = {}
 
-    def pick(key: str, flag: object, env_names: tuple[str, ...]) -> object:
+    def pick(
+        key: str,
+        flag: object,
+        env_names: tuple[str, ...],
+        file_key: str | None = None,
+    ) -> object:
+        """Resolve one setting. ``file_key`` lets a provider keep its own
+        persisted value under a different name, so an Azure endpoint in the
+        config file can never be picked up by an OpenRouter request."""
+        stored = file_key or key
         if flag not in (None, ""):
             sources[key] = "flag"
             return flag
@@ -239,20 +297,48 @@ def resolve(
             if got:
                 sources[key] = f"env:{name}"
                 return got
-        if values.get(key) not in (None, ""):
+        if values.get(stored) not in (None, ""):
             sources[key] = "config file"
-            return values[key]
+            return values[stored]
         sources[key] = "default"
         return None
 
-    resolved_endpoint = pick("endpoint", endpoint, ("QQ_ENDPOINT", "AZURE_OPENAI_ENDPOINT"))
-    resolved_deployment = pick("deployment", deployment, ("QQ_DEPLOYMENT",))
-    resolved_key = pick("api_key", None, ("QQ_API_KEY", "AZURE_OPENAI_API_KEY"))
+    resolved_provider = pick("provider", provider, ("QQ_PROVIDER",))
+    provider_name = str(resolved_provider or "azure").lower()
+    if provider_name not in PROVIDERS:
+        raise ConfigError(
+            f"unknown provider {provider_name!r}",
+            hint=f"Valid providers: {', '.join(PROVIDERS)}.",
+        )
+    is_openrouter = provider_name == "openrouter"
+
+    if is_openrouter:
+        # OpenRouter publishes one fixed base URL. Reading the config file's
+        # endpoint here would point an OpenRouter key at an Azure host.
+        resolved_endpoint = endpoint
+        sources["endpoint"] = "flag" if endpoint else "default"
+        resolved_deployment = pick(
+            "deployment", deployment, ("QQ_DEPLOYMENT", "QQ_MODEL"), file_key="openrouter_model"
+        )
+    else:
+        resolved_endpoint = pick("endpoint", endpoint, ("QQ_ENDPOINT", "AZURE_OPENAI_ENDPOINT"))
+        resolved_deployment = pick("deployment", deployment, ("QQ_DEPLOYMENT",))
+
+    # Each provider keeps its own key, so both can be configured at once and
+    # QQ_PROVIDER=openrouter works without clobbering the Azure setup.
+    if is_openrouter:
+        resolved_key = pick(
+            "openrouter_api_key", None, ("QQ_OPENROUTER_API_KEY", "OPENROUTER_API_KEY")
+        )
+    else:
+        resolved_key = pick("api_key", None, ("QQ_API_KEY", "AZURE_OPENAI_API_KEY"))
     resolved_auth = pick("auth", auth, ("QQ_AUTH",))
     resolved_tenant = pick("tenant", tenant, ("QQ_TENANT_ID", "AZURE_TENANT_ID"))
     resolved_model = pick("model", model, ("QQ_MODEL",))
     resolved_api = pick("api", api, ("QQ_API",))
     resolved_router = pick("router", router, ("QQ_ROUTER",))
+    resolved_cost_tier = pick("cost_tier", cost_tier, ("QQ_COST_TIER",))
+    resolved_allowed = pick("allowed_models", None, ("QQ_ALLOWED_MODELS",))
     resolved_timeout = pick("timeout", timeout, ("QQ_TIMEOUT",))
 
     auth_mode = str(resolved_auth or "auto").lower()
@@ -269,20 +355,32 @@ def resolve(
             hint=f"Valid surfaces: {', '.join(API_SURFACES)}.",
         )
 
+    tier = str(resolved_cost_tier).lower() if resolved_cost_tier else None
+    if tier is not None and tier not in COST_TIERS:
+        raise ConfigError(
+            f"invalid cost tier {tier!r}",
+            hint=f"Valid tiers: {', '.join(COST_TIERS)}.",
+        )
+
     try:
         timeout_value = float(resolved_timeout) if resolved_timeout else DEFAULT_TIMEOUT
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"invalid timeout {resolved_timeout!r}") from exc
 
+    default_deployment = OPENROUTER_DEFAULT_MODEL if is_openrouter else DEFAULT_DEPLOYMENT
+
     return Settings(
+        provider=provider_name,
         endpoint=str(resolved_endpoint or ""),
-        deployment=str(resolved_deployment or DEFAULT_DEPLOYMENT),
+        deployment=str(resolved_deployment or default_deployment),
         api_key=str(resolved_key) if resolved_key else None,
         auth=auth_mode,
         tenant=str(resolved_tenant) if resolved_tenant else None,
         model=str(resolved_model) if resolved_model else None,
         api=api_surface,
         router=str(resolved_router) if resolved_router else None,
+        cost_tier=tier,
+        allowed_models=str(resolved_allowed) if resolved_allowed else None,
         timeout=timeout_value,
         sources=sources,
     )

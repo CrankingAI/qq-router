@@ -1,32 +1,22 @@
-"""Talk to Azure AI Foundry.
+"""Shared client layer.
 
-This is the only module that knows about Azure. Everything above it deals in
-``Answer`` objects, so a second backend could be added without touching
-argument parsing or terminal output.
+Every backend qq speaks to exposes an OpenAI-compatible API, so the request
+and response handling lives here once and each provider module supplies only
+what actually differs: how the client is authenticated, and which vendor
+extensions its responses carry.
 
-**Why two API surfaces.** Azure exposes both Chat Completions and the newer
-Responses API on the ``/openai/v1`` route, but they are not supported by the
-same models. As of September 2026 the ``model-router`` model advertises only
-the ``chatCompletion`` capability in every region; calling ``/openai/v1/responses``
-against a router deployment returns ``400 The requested operation is unsupported``.
-Direct model deployments such as ``gpt-5.6-luna`` advertise ``responses`` as well.
+Answer is the boundary. Everything above this layer, argument parsing and
+terminal output, deals in Answer objects and knows nothing about which
+provider produced one.
 
-So qq defaults to Chat Completions, which the router requires, and offers
-``--api responses`` for direct deployments. Both surfaces report the model that
-actually served the request, which is what ``--verbose`` prints.
+Two deliberate choices survive from the original Azure-only version:
 
-Check what a model supports before switching::
-
-    az cognitiveservices model list --location eastus2 \\
-      --query "[?model.name=='model-router'].model.capabilities" -o json
-
-Two other deliberate choices:
-
-* ``openai`` and ``azure_identity`` are imported inside functions. Importing
-  them costs a few hundred milliseconds, and ``qq --help`` should not pay it.
-* Entra authentication passes the token provider *callable* as ``api_key``.
-  The v1 client invokes it per request, so the bearer token refreshes instead
-  of expiring an hour into a long-lived shell.
+* openai and any credential library are imported inside functions.
+  Importing them costs a few hundred milliseconds, and qq --help should
+  not pay it.
+* Bearer credentials are handed to the SDK as a *callable* where the provider
+  supports it, so the token refreshes per request instead of expiring an hour
+  into a long-lived shell.
 """
 
 from __future__ import annotations
@@ -40,13 +30,8 @@ from .config import Settings
 from .errors import AuthError, ConfigError, NetworkError, QQError
 from .prompt import SYSTEM_INSTRUCTION
 
-#: Token audience for Microsoft Entra ID against Azure AI Foundry. The older
-#: https://cognitiveservices.azure.com/.default audience is for classic Azure
-#: OpenAI resources.
-ENTRA_SCOPE = "https://ai.azure.com/.default"
-
 #: API surfaces qq can speak. "auto" resolves to "chat", the only surface the
-#: model router supports.
+#: Azure model router supports and the one every provider implements.
 API_SURFACES = ("auto", "chat", "responses")
 
 
@@ -81,7 +66,9 @@ class Answer:
     input_tokens: int | None = None
     output_tokens: int | None = None
     # -vv
+    provider: str = ""
     router: str | None = None
+    cost: float | None = None
     host: str = ""
     api: str = ""
     auth: str = ""
@@ -94,6 +81,9 @@ class Answer:
     reasoning_tokens: int | None = None
     token_cache: str | None = None
     tenant: str | None = None
+    upstream: str | None = None
+    strategy: str | None = None
+    task_type: str | None = None
 
     def _tier1(self) -> str:
         parts = [f"deployment={self.deployment or '?'}", f"model={self.model or '?'}"]
@@ -104,6 +94,8 @@ class Answer:
 
     def _tier2(self) -> str:
         parts = []
+        if self.provider:
+            parts.append(f"provider={self.provider}")
         # Recorded when the CLI was configured. The inference API does not
         # report what a deployment is backed by, so this cannot be derived
         # live; it is labelled as configuration, not observation.
@@ -113,6 +105,10 @@ class Answer:
         parts.append(f"api={self.api or '?'}")
         parts.append(f"auth={self.auth or '?'}")
         parts.append(f"stream={'on' if self.stream else 'off'}")
+        if self.cost is not None:
+            # OpenRouter reports the real charge per request. Six decimals
+            # because a terminal question routinely costs less than a cent.
+            parts.append(f"cost=${self.cost:.6f}")
         if self.request_id:
             parts.append(f"request={self.request_id}")
         return "[" + " ".join(parts) + "]"
@@ -129,6 +125,12 @@ class Answer:
                 lines.append("[server " + " ".join(timing) + "]")
 
         detail = []
+        if self.upstream:
+            detail.append(f"upstream={self.upstream}")
+        if self.strategy:
+            detail.append(f"strategy={self.strategy}")
+        if self.task_type:
+            detail.append(f"task={self.task_type}")
         if self.replica:
             detail.append(f"replica={self.replica}")
         if self.cached_tokens is not None:
@@ -283,120 +285,76 @@ def _chat_usage(response: Any) -> tuple[int | None, int | None]:
     return _attr(usage, "prompt_tokens"), _attr(usage, "completion_tokens")
 
 
-def build_credential(tenant: str | None = None) -> Any:
-    """Build an Entra ID credential, optionally pinned to one tenant.
-
-    Pinning matters more than it looks. ``DefaultAzureCredential`` asks the
-    Azure CLI for a token using the CLI's *current* subscription, which is
-    global mutable state shared by every shell on the machine. If that default
-    points at a different tenant than your Foundry resource, Azure rejects the
-    call with "Tenant provided in token does not match resource token" even
-    though you are perfectly well logged in.
-
-    With a tenant configured, the CLI credential is asked for that tenant
-    explicitly and the rest of the default chain is pinned to it too.
-    """
-    try:
-        from azure.identity import (
-            AzureCliCredential,
-            ChainedTokenCredential,
-            DefaultAzureCredential,
-        )
-    except ImportError as exc:  # pragma: no cover - packaging guarantees this
-        raise ConfigError(
-            "azure-identity is not installed, so Entra ID sign-in is unavailable",
-            hint="Reinstall qq, or set QQ_API_KEY to use API-key authentication.",
-        ) from exc
-
-    if not tenant:
-        return DefaultAzureCredential()
-
-    return ChainedTokenCredential(
-        AzureCliCredential(tenant_id=tenant),
-        DefaultAzureCredential(
-            interactive_browser_tenant_id=tenant,
-            shared_cache_tenant_id=tenant,
-            visual_studio_code_tenant_id=tenant,
-            workload_identity_tenant_id=tenant,
-        ),
-    )
-
-
-def entra_token_provider(
-    scope: str = ENTRA_SCOPE,
-    tenant: str | None = None,
-    stats: dict[str, Any] | None = None,
-) -> Callable[[], str]:
-    """Build a bearer-token provider backed by Entra ID.
-
-    Returned uncalled to the OpenAI client, which invokes it per request. A
-    cached token is reused across processes until shortly before it expires,
-    which removes roughly 0.65s of ``az`` startup from every question.
-    """
-    from . import tokencache
-
-    key = tokencache.cache_key(tenant, scope)
-    credential: Any = None
-
-    def provider() -> str:
-        nonlocal credential
-        cached = tokencache.load(key)
-        if cached:
-            if stats is not None:
-                stats["token_cache"] = "hit"
-            return cached
-        if credential is None:
-            credential = build_credential(tenant)
-        access = credential.get_token(scope)
-        tokencache.store(key, access.token, access.expires_on)
-        if stats is not None:
-            stats["token_cache"] = "off" if tokencache.disabled() else "miss"
-        return access.token
-
-    return provider
-
-
 def _short(exc: Any, limit: int = 300) -> str:
     message = getattr(exc, "message", None) or str(exc)
     message = " ".join(str(message).split())
     return message if len(message) <= limit else message[: limit - 1] + "…"
 
 
-def translate_error(exc: Exception) -> QQError:
+#: Per-provider remediation text. Keeping it in one table makes it obvious
+#: when a provider is missing a hint for a failure mode that can happen to it.
+_AUTH_HINTS = {
+    "azure": (
+        "For key auth, check QQ_API_KEY. For Entra auth, run 'az login' and make "
+        "sure you hold the Foundry User role on the Foundry account."
+    ),
+    "openrouter": (
+        "Check QQ_OPENROUTER_API_KEY or OPENROUTER_API_KEY. Create a key at "
+        "https://openrouter.ai/keys."
+    ),
+}
+_DENIED_HINTS = {
+    "azure": "Grant the Foundry User role on the Foundry account, then retry.",
+    "openrouter": "The key may be disabled, or the request was blocked by moderation.",
+}
+_NOT_FOUND_HINTS = {
+    "azure": "Check QQ_DEPLOYMENT matches a deployment on this resource: 'qq doctor'.",
+    "openrouter": (
+        "Either the model slug is wrong, or your allowed_models restrictions matched "
+        "nothing. Check 'qq config show'."
+    ),
+}
+
+
+def translate_error(exc: Exception, provider: str = "azure") -> QQError:
     """Map an SDK exception onto a qq error with an actionable hint."""
     import openai
 
+    label = "OpenRouter" if provider == "openrouter" else "Azure"
+
     if isinstance(exc, openai.AuthenticationError):
         return AuthError(
-            "Azure rejected the credentials (401)",
-            hint=(
-                "For key auth, check QQ_API_KEY. For Entra auth, run 'az login' and make "
-                "sure you hold the Foundry User role on the Foundry account."
-            ),
+            f"{label} rejected the credentials (401)",
+            hint=_AUTH_HINTS.get(provider, _AUTH_HINTS["azure"]),
         )
     if isinstance(exc, openai.PermissionDeniedError):
         return AuthError(
-            "Azure accepted the identity but denied access (403)",
-            hint="Grant the Foundry User role on the Foundry account, then retry.",
+            f"{label} accepted the identity but denied access (403)",
+            hint=_DENIED_HINTS.get(provider, _DENIED_HINTS["azure"]),
         )
     if isinstance(exc, openai.NotFoundError):
         return ConfigError(
-            "deployment not found (404)",
-            hint="Check QQ_DEPLOYMENT matches a deployment on this resource: 'qq doctor'.",
+            f"{'model' if provider == 'openrouter' else 'deployment'} not found (404)",
+            hint=_NOT_FOUND_HINTS.get(provider, _NOT_FOUND_HINTS["azure"]),
+        )
+    if isinstance(exc, openai.APIStatusError) and exc.status_code == 402:
+        return QQError(
+            "OpenRouter reports insufficient credits (402)",
+            hint="Top up at https://openrouter.ai/settings/credits.",
         )
     if isinstance(exc, openai.RateLimitError):
         return NetworkError(
-            "rate limited by Azure (429)",
+            f"rate limited by {label} (429)",
             hint="Wait a moment, or raise routerCapacity and redeploy the Bicep.",
         )
     if isinstance(exc, openai.APITimeoutError):
         return NetworkError(
-            "the request to Azure timed out",
+            f"the request to {label} timed out",
             hint="Retry, or raise the timeout with --timeout / QQ_TIMEOUT.",
         )
     if isinstance(exc, openai.APIConnectionError):
         return NetworkError(
-            f"could not reach Azure: {exc}",
+            f"could not reach {label}: {exc}",
             hint="Check network connectivity and that QQ_ENDPOINT is correct.",
         )
     if isinstance(exc, openai.BadRequestError):
@@ -412,56 +370,76 @@ def translate_error(exc: Exception) -> QQError:
                 "This deployment does not support that API surface. model-router speaks "
                 "Chat Completions only, so drop '--api responses'."
             )
-        return QQError(f"Azure rejected the request (400): {detail}", hint=hint)
+        return QQError(f"{label} rejected the request (400): {detail}", hint=hint)
     if isinstance(exc, openai.APIStatusError):
-        return QQError(f"Azure returned HTTP {exc.status_code}: {_short(exc)}")
+        return QQError(f"{label} returned HTTP {exc.status_code}: {_short(exc)}")
     if isinstance(exc, openai.OpenAIError):
         return QQError(f"OpenAI client error: {exc}")
     return QQError(str(exc))
 
 
-class FoundryBackend:
-    """Azure AI Foundry backend, speaking Chat Completions or Responses."""
+class Backend:
+    """An OpenAI-compatible chat backend.
+
+    Subclasses supply provider, provider_label and _build_client.
+    Everything else, including both API surfaces, streaming and diagnostics
+    collection, is shared.
+    """
+
+    #: Short machine-readable provider id, used in diagnostics and error hints.
+    provider = "openai"
+    #: Human-readable name, used in error messages.
+    provider_label = "The service"
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._cached: Any = None
         self._auth_stats: dict[str, Any] = {}
 
-    # -- wiring -------------------------------------------------------------
+    def _build_client(self) -> Any:  # pragma: no cover - abstract
+        raise NotImplementedError
 
-    def _build_client(self) -> Any:
-        if self._cached is not None:
-            return self._cached
+    def request_options(self) -> dict[str, Any]:
+        """Extra kwargs to attach to every request.
 
-        from openai import OpenAI
+        Providers use this for vendor headers and body fields. The default is
+        nothing, which keeps the Azure path byte-identical to a plain call.
+        """
+        return {}
 
-        from .telemetry import setup as setup_telemetry
+    @property
+    def router_label(self) -> str | None:
+        """What the target deployment or model is backed by, if known."""
+        return self.settings.router
 
-        setup_telemetry()
+    def collect_provider_meta(self, meta: dict[str, Any], response: Any, usage: Any = None) -> None:
+        """Fold provider-specific response extras into meta. Default: nothing."""
 
-        base_url = self.settings.require_endpoint()
-        mode = self.settings.effective_auth
+    def check_inline_error(self, payload: Any) -> None:
+        """Raise if the body carries an error despite a 2xx status.
 
-        if mode == "key":
-            if not self.settings.api_key:
-                raise ConfigError(
-                    "auth mode is 'key' but no API key is configured",
-                    hint="Set QQ_API_KEY, or switch to Entra with QQ_AUTH=entra.",
-                )
-            credential: Any = self.settings.api_key
+        OpenRouter returns HTTP 200 as soon as an upstream provider accepts the
+        request, so a later failure arrives as an ``error`` object in the body
+        with no ``choices``. The SDK does not raise for that, and without this
+        check the user would see "returned an empty answer" instead of the real
+        reason. Azure never does this, so the check is a no-op there.
+        """
+        error = _extra(payload, "error")
+        if not error:
+            return
+        if isinstance(error, dict):
+            message = error.get("message") or str(error)
+            code = error.get("code")
+            metadata = error.get("metadata") or {}
+            kind = metadata.get("error_type") if isinstance(metadata, dict) else None
         else:
-            # Passed uncalled on purpose: the SDK invokes it per request, which
-            # keeps the bearer token fresh.
-            credential = entra_token_provider(tenant=self.settings.tenant, stats=self._auth_stats)
-
-        self._cached = OpenAI(
-            base_url=base_url,
-            api_key=credential,
-            timeout=self.settings.timeout,
-            max_retries=2,
-        )
-        return self._cached
+            message, code, kind = str(error), None, None
+        prefix = f"{self.provider_label} error"
+        if code is not None:
+            prefix += f" ({code})"
+        if kind:
+            prefix += f" [{kind}]"
+        raise QQError(f"{prefix}: {message}")
 
     @property
     def target(self) -> str:
@@ -512,11 +490,11 @@ class FoundryBackend:
         except QQError:
             raise
         except Exception as exc:
-            raise translate_error(exc) from exc
+            raise translate_error(exc, self.provider) from exc
 
         if not text:
             raise QQError(
-                "Azure returned an empty answer",
+                f"{self.provider_label} returned an empty answer",
                 hint="Retry, or run with --verbose to see the routing details.",
             )
         return Answer(
@@ -526,7 +504,9 @@ class FoundryBackend:
             latency=time.monotonic() - started,
             input_tokens=usage[0],
             output_tokens=usage[1],
-            router=self.settings.router,
+            provider=self.provider,
+            router=self.router_label,
+            cost=meta.get("cost"),
             host=self.host,
             api=self.surface,
             auth=self.settings.effective_auth,
@@ -538,6 +518,9 @@ class FoundryBackend:
             reasoning_tokens=meta.get("reasoning_tokens"),
             token_cache=self._auth_stats.get("token_cache"),
             tenant=self.settings.tenant,
+            upstream=meta.get("upstream"),
+            strategy=meta.get("strategy"),
+            task_type=meta.get("task_type"),
         )
 
     # -- Chat Completions ---------------------------------------------------
@@ -556,8 +539,12 @@ class FoundryBackend:
             {"role": "user", "content": prompt},
         ]
         if not stream:
-            response = client.chat.completions.create(model=target, messages=messages)
+            response = client.chat.completions.create(
+                model=target, messages=messages, **self.request_options()
+            )
+            self.check_inline_error(response)
             _merge_meta(meta, response, _attr(response, "usage"))
+            self.collect_provider_meta(meta, response, _attr(response, "usage"))
             return extract_chat_text(response), _attr(response, "model"), _chat_usage(response)
 
         chunks: list[str] = []
@@ -568,11 +555,14 @@ class FoundryBackend:
             messages=messages,
             stream=True,
             stream_options={"include_usage": True},
+            **self.request_options(),
         )
         for event in events:
+            self.check_inline_error(event)
             model = _attr(event, "model") or model
             event_usage = _attr(event, "usage")
             _merge_meta(meta, event, event_usage)
+            self.collect_provider_meta(meta, event, event_usage)
             if event_usage is not None:
                 usage = _chat_usage(event)
             for choice in _attr(event, "choices") or []:
@@ -597,9 +587,14 @@ class FoundryBackend:
     ) -> tuple[str, str | None, tuple[int | None, int | None]]:
         if not stream:
             response = client.responses.create(
-                model=target, instructions=SYSTEM_INSTRUCTION, input=prompt
+                model=target,
+                instructions=SYSTEM_INSTRUCTION,
+                input=prompt,
+                **self.request_options(),
             )
+            self.check_inline_error(response)
             _merge_meta(meta, response, _attr(response, "usage"))
+            self.collect_provider_meta(meta, response, _attr(response, "usage"))
             return (
                 extract_responses_text(response),
                 _attr(response, "model"),
@@ -609,7 +604,11 @@ class FoundryBackend:
         chunks: list[str] = []
         final: Any = None
         events = client.responses.create(
-            model=target, instructions=SYSTEM_INSTRUCTION, input=prompt, stream=True
+            model=target,
+            instructions=SYSTEM_INSTRUCTION,
+            input=prompt,
+            stream=True,
+            **self.request_options(),
         )
         for event in events:
             kind = _attr(event, "type") or ""
@@ -632,5 +631,18 @@ class FoundryBackend:
         return text, model, usage
 
 
-#: Backwards-compatible alias from when qq only spoke the Responses API.
-ResponsesBackend = FoundryBackend
+def build_backend(settings: Settings) -> Backend:
+    """Pick a backend from the resolved settings.
+
+    Imported lazily so that selecting one provider never pays the import cost
+    of the other's credential stack.
+    """
+    provider = settings.effective_provider
+    if provider == "openrouter":
+        from .openrouter import OpenRouterBackend
+
+        return OpenRouterBackend(settings)
+
+    from .azure import AzureFoundryBackend
+
+    return AzureFoundryBackend(settings)

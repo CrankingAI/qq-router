@@ -69,7 +69,7 @@ def stub_backend(monkeypatch):
     StubBackend.last_prompt = None
     StubBackend.last_stream = None
     StubBackend.raises = None
-    monkeypatch.setattr(client_module, "FoundryBackend", StubBackend)
+    monkeypatch.setattr(client_module, "build_backend", StubBackend)
     monkeypatch.setenv("QQ_ENDPOINT", "https://x.openai.azure.com")
     monkeypatch.setenv("QQ_API_KEY", SECRET)
     monkeypatch.setenv("QQ_DEPLOYMENT", "qq-router")

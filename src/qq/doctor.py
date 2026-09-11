@@ -64,7 +64,15 @@ def _check_dependencies() -> Check:
     return Check(OK, "dependencies", ", ".join(versions))
 
 
+def _check_provider(settings) -> Check:
+    label = "Azure AI Foundry" if settings.effective_provider == "azure" else "OpenRouter"
+    source = settings.sources.get("provider", "default")
+    return Check(OK, "provider", f"{settings.effective_provider} ({label})  [{source}]")
+
+
 def _check_endpoint(settings) -> Check:
+    if settings.effective_provider == "openrouter":
+        return Check(OK, "endpoint", settings.base_url)
     if not settings.endpoint:
         return Check(
             FAIL,
@@ -78,6 +86,9 @@ def _check_endpoint(settings) -> Check:
 
 def _check_deployment(settings) -> Check:
     source = settings.sources.get("deployment", "default")
+    if settings.effective_provider == "openrouter":
+        tier = f" cost_tier={settings.cost_tier}" if settings.cost_tier else ""
+        return Check(OK, "model", f"{settings.deployment}{tier}  [{source}]")
     if source == "default":
         return Check(
             WARN,
@@ -91,11 +102,25 @@ def _check_deployment(settings) -> Check:
 def _check_auth(settings) -> Check:
     mode = settings.effective_auth
     if mode == "key":
-        source = settings.sources.get("api_key", "?")
+        key_name = (
+            "openrouter_api_key" if settings.effective_provider == "openrouter" else "api_key"
+        )
+        source = settings.sources.get(key_name, "?")
+        if not settings.api_key:
+            return Check(
+                FAIL,
+                "auth",
+                "no API key configured",
+                (
+                    "Set QQ_OPENROUTER_API_KEY, or run 'qq config set openrouter_api_key <key>'."
+                    if settings.effective_provider == "openrouter"
+                    else "Set QQ_API_KEY, or switch to Entra with QQ_AUTH=entra."
+                ),
+            )
         return Check(OK, "auth", f"API key {redact(settings.api_key)}  [{source}]")
 
     try:
-        from .client import ENTRA_SCOPE, entra_token_provider
+        from .azure import ENTRA_SCOPE, entra_token_provider
 
         provider = entra_token_provider(tenant=settings.tenant)
         token = provider()
@@ -125,19 +150,20 @@ def _check_surface(settings) -> Check:
 
 
 def _check_call(settings) -> Check:
-    from .client import FoundryBackend
+    from .client import build_backend
     from .errors import QQError
 
-    backend = FoundryBackend(settings)
+    backend = build_backend(settings)
+    label = f"{backend.provider} call"
     try:
         answer = backend.ask("Reply with the single word: ok")
     except QQError as exc:
-        return Check(FAIL, "azure call", exc.message, exc.hint or "")
+        return Check(FAIL, label, exc.message, exc.hint or "")
     except Exception as exc:  # pragma: no cover - defensive
-        return Check(FAIL, "azure call", f"{type(exc).__name__}: {exc}")
+        return Check(FAIL, label, f"{type(exc).__name__}: {exc}")
     return Check(
         OK,
-        "azure call",
+        label,
         f"routed to {answer.model or '?'} in {answer.latency:.2f}s via {answer.deployment}",
     )
 
@@ -158,7 +184,12 @@ def run_doctor(verbose: bool = False) -> int:
         _emit(Check(FAIL, "config", str(exc), "Fix or delete the config file."))
         return EXIT_ERROR
 
-    staged = [_check_endpoint(settings), _check_deployment(settings), _check_surface(settings)]
+    staged = [
+        _check_provider(settings),
+        _check_endpoint(settings),
+        _check_deployment(settings),
+        _check_surface(settings),
+    ]
     for check in staged:
         _emit(check)
         checks.append(check)

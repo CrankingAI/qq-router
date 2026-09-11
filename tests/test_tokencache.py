@@ -86,7 +86,7 @@ def test_clear_removes_the_file():
 
 def test_provider_uses_the_cache_and_only_calls_azure_once(monkeypatch):
     """The whole point: a second process must not pay for a second az call."""
-    from qq import client
+    from qq import azure as client
 
     calls = []
 
