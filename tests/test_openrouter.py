@@ -349,3 +349,30 @@ def test_an_openrouter_config_file_cannot_leak_into_an_azure_request():
     assert s.deployment == "qq-router"
     assert s.api_key is None
     assert "openai.azure.com" in s.base_url
+
+
+def test_tenant_is_azure_only_and_never_appears_in_openrouter_output():
+    """Entra tenants are an Azure concept; leaking one into OpenRouter
+    diagnostics implies a relationship that does not exist."""
+    stored = {
+        "provider": "openrouter",
+        "openrouter_api_key": "sk-or-test",
+        "tenant": "00000000-1111-2222-3333-444444444444",
+    }
+    backend = OpenRouterBackend(resolve(env={}, file_values=stored))
+    assert backend.tenant_label is None
+
+    answer = _ask(backend, or_response(usage=ORUsage(1, 1)))
+    assert answer.tenant is None
+    assert "tenant=" not in answer.diagnostics(3)
+
+
+def test_azure_still_reports_its_tenant():
+    from qq.azure import AzureFoundryBackend
+
+    stored = {
+        "endpoint": "https://x.openai.azure.com",
+        "tenant": "00000000-1111-2222-3333-444444444444",
+    }
+    backend = AzureFoundryBackend(resolve(env={}, file_values=stored))
+    assert backend.tenant_label == "00000000-1111-2222-3333-444444444444"

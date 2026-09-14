@@ -29,7 +29,7 @@ from .errors import ConfigError
 ENTRA_SCOPE = "https://ai.azure.com/.default"
 
 
-def build_credential(tenant: str | None = None) -> Any:
+def build_credential(tenant: str | None = None, subscription: str | None = None) -> Any:
     """Build an Entra ID credential, optionally pinned to one tenant.
 
     Pinning matters more than it looks. ``DefaultAzureCredential`` asks the
@@ -54,11 +54,26 @@ def build_credential(tenant: str | None = None) -> Any:
             hint="Reinstall qq, or set QQ_API_KEY to use API-key authentication.",
         ) from exc
 
-    if not tenant:
+    if not tenant and not subscription:
         return DefaultAzureCredential()
 
+    # Pinning the tenant alone is not enough. The Azure CLI resolves a tenant
+    # against whatever account is currently the default, so if that default
+    # belongs to an unrelated directory the token request fails even though the
+    # right credential is still cached. Naming the subscription picks the
+    # correct account directly, which is what 'az account get-access-token
+    # --subscription' does.
+    #
+    # The two must not be combined: 'az' refuses "--subscription" together
+    # with "--tenant", and when the CLI credential errors out the chain falls
+    # through to slower fallbacks that can hang waiting on an interactive
+    # sign-in. A subscription implies its tenant, so it wins when present.
+    cli_kwargs: dict[str, Any] = (
+        {"subscription": subscription} if subscription else {"tenant_id": tenant}
+    )
+
     return ChainedTokenCredential(
-        AzureCliCredential(tenant_id=tenant),
+        AzureCliCredential(**cli_kwargs),
         DefaultAzureCredential(
             interactive_browser_tenant_id=tenant,
             shared_cache_tenant_id=tenant,
@@ -72,6 +87,7 @@ def entra_token_provider(
     scope: str = ENTRA_SCOPE,
     tenant: str | None = None,
     stats: dict[str, Any] | None = None,
+    subscription: str | None = None,
 ) -> Callable[[], str]:
     """Build a bearer-token provider backed by Entra ID.
 
@@ -81,7 +97,7 @@ def entra_token_provider(
     """
     from . import tokencache
 
-    key = tokencache.cache_key(tenant, scope)
+    key = tokencache.cache_key(f"{tenant or ''}|{subscription or ''}", scope)
     credential: Any = None
 
     def provider() -> str:
@@ -92,7 +108,7 @@ def entra_token_provider(
                 stats["token_cache"] = "hit"
             return cached
         if credential is None:
-            credential = build_credential(tenant)
+            credential = build_credential(tenant, subscription)
         access = credential.get_token(scope)
         tokencache.store(key, access.token, access.expires_on)
         if stats is not None:
@@ -107,6 +123,10 @@ class AzureFoundryBackend(Backend):
 
     provider = "azure"
     provider_label = "Azure"
+
+    @property
+    def tenant_label(self) -> str | None:
+        return self.settings.tenant
 
     def _build_client(self) -> Any:
         if self._cached is not None:
@@ -131,7 +151,11 @@ class AzureFoundryBackend(Backend):
         else:
             # Passed uncalled on purpose: the SDK invokes it per request, which
             # keeps the bearer token fresh.
-            credential = entra_token_provider(tenant=self.settings.tenant, stats=self._auth_stats)
+            credential = entra_token_provider(
+                tenant=self.settings.tenant,
+                stats=self._auth_stats,
+                subscription=self.settings.subscription,
+            )
 
         self._cached = OpenAI(
             base_url=base_url,

@@ -112,10 +112,20 @@ def _show() -> int:
     return EXIT_OK
 
 
+#: Config keys a provider stores under its own name but which resolve onto a
+#: shared Settings field. Without this, 'qq config get openrouter_api_key'
+#: looked up a Settings attribute that does not exist and always said "not set",
+#: even with a key stored in the file.
+_KEY_TO_FIELD = {
+    "openrouter_api_key": "api_key",
+    "openrouter_model": "deployment",
+}
+
+
 def _get(key: str) -> int:
     _check_key(key)
     settings = resolve()
-    value = getattr(settings, key, None)
+    value = getattr(settings, _KEY_TO_FIELD.get(key, key), None)
     print(_display(key, value))
     return EXIT_OK
 

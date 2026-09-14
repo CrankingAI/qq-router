@@ -122,7 +122,7 @@ def _check_auth(settings) -> Check:
     try:
         from .azure import ENTRA_SCOPE, entra_token_provider
 
-        provider = entra_token_provider(tenant=settings.tenant)
+        provider = entra_token_provider(tenant=settings.tenant, subscription=settings.subscription)
         token = provider()
     except Exception as exc:  # credential chain failures are varied and noisy
         return Check(

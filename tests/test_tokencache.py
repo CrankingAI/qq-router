@@ -99,7 +99,9 @@ def test_provider_uses_the_cache_and_only_calls_azure_once(monkeypatch):
             calls.append(scope)
             return FakeAccessToken()
 
-    monkeypatch.setattr(client, "build_credential", lambda tenant=None: FakeCredential())
+    monkeypatch.setattr(
+        client, "build_credential", lambda tenant=None, subscription=None: FakeCredential()
+    )
 
     first = client.entra_token_provider(scope="scope", tenant="t")
     assert first() == "fresh-token"
@@ -109,3 +111,36 @@ def test_provider_uses_the_cache_and_only_calls_azure_once(monkeypatch):
     second = client.entra_token_provider(scope="scope", tenant="t")
     assert second() == "fresh-token"
     assert len(calls) == 1
+
+
+def test_cli_credential_never_receives_both_subscription_and_tenant(monkeypatch):
+    """'az account get-access-token' rejects --subscription with --tenant, and
+    the resulting chain fallback was observed hanging for minutes."""
+    from qq import azure
+
+    captured = {}
+
+    class FakeCli:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    class FakeChain:
+        def __init__(self, *creds):
+            pass
+
+    class FakeDefault:
+        def __init__(self, **kwargs):
+            pass
+
+    import azure.identity as ident
+
+    monkeypatch.setattr(ident, "AzureCliCredential", FakeCli)
+    monkeypatch.setattr(ident, "ChainedTokenCredential", FakeChain)
+    monkeypatch.setattr(ident, "DefaultAzureCredential", FakeDefault)
+
+    azure.build_credential(tenant="t", subscription="s")
+    assert captured == {"subscription": "s"}
+
+    captured.clear()
+    azure.build_credential(tenant="t", subscription=None)
+    assert captured == {"tenant_id": "t"}

@@ -49,6 +49,7 @@ SETTABLE_KEYS = (
     "openrouter_api_key",
     "openrouter_model",
     "tenant",
+    "subscription",
     "model",
     "api",
     "router",
@@ -178,6 +179,9 @@ class Settings:
     api_key: str | None = None
     auth: str = "auto"
     tenant: str | None = None
+    #: Azure subscription id. Used only to disambiguate which Azure CLI account
+    #: to ask for a token, never sent anywhere.
+    subscription: str | None = None
     #: What the Azure deployment is backed by, e.g. "model-router:2025-11-18".
     #: Recorded by scripts/setup-cli.sh: the inference API does not report it,
     #: so it reflects configuration time rather than live state.
@@ -334,6 +338,9 @@ def resolve(
         resolved_key = pick("api_key", None, ("QQ_API_KEY", "AZURE_OPENAI_API_KEY"))
     resolved_auth = pick("auth", auth, ("QQ_AUTH",))
     resolved_tenant = pick("tenant", tenant, ("QQ_TENANT_ID", "AZURE_TENANT_ID"))
+    resolved_subscription = pick(
+        "subscription", None, ("QQ_SUBSCRIPTION_ID", "AZURE_SUBSCRIPTION_ID")
+    )
     resolved_model = pick("model", model, ("QQ_MODEL",))
     resolved_api = pick("api", api, ("QQ_API",))
     resolved_router = pick("router", router, ("QQ_ROUTER",))
@@ -376,6 +383,7 @@ def resolve(
         api_key=str(resolved_key) if resolved_key else None,
         auth=auth_mode,
         tenant=str(resolved_tenant) if resolved_tenant else None,
+        subscription=str(resolved_subscription) if resolved_subscription else None,
         model=str(resolved_model) if resolved_model else None,
         api=api_surface,
         router=str(resolved_router) if resolved_router else None,

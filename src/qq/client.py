@@ -416,6 +416,11 @@ class Backend:
         """What the target deployment or model is backed by, if known."""
         return self.settings.router
 
+    @property
+    def tenant_label(self) -> str | None:
+        """Entra tenant, where the provider has one. Most do not."""
+        return None
+
     def collect_provider_meta(self, meta: dict[str, Any], response: Any, usage: Any = None) -> None:
         """Fold provider-specific response extras into meta. Default: nothing."""
 
@@ -460,9 +465,8 @@ class Backend:
         """Hostname of the configured endpoint, for diagnostics."""
         from urllib.parse import urlparse
 
-        if not self.settings.endpoint:
-            return ""
-        return urlparse(self.settings.base_url).netloc
+        base = self.settings.base_url
+        return urlparse(base).netloc if base else ""
 
     # -- public API ---------------------------------------------------------
 
@@ -521,7 +525,7 @@ class Backend:
             cached_tokens=meta.get("cached_tokens"),
             reasoning_tokens=meta.get("reasoning_tokens"),
             token_cache=self._auth_stats.get("token_cache"),
-            tenant=self.settings.tenant,
+            tenant=self.tenant_label,
             upstream=meta.get("upstream"),
             strategy=meta.get("strategy"),
             task_type=meta.get("task_type"),

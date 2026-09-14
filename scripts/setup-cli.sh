@@ -240,6 +240,13 @@ if [[ "$SKIP_CONFIG" != true ]]; then
     "$QQ_BIN" config set tenant "$TENANT_ID" >/dev/null
     echo "    Entra tenant: $TENANT_ID"
   fi
+  # The subscription pins which Azure CLI account qq asks for a token. Without
+  # it, a tenant pin alone still resolves against the CLI's current default
+  # account, and that default can drift to an unrelated directory.
+  if [[ -n "${SUBSCRIPTION:-}" ]]; then
+    "$QQ_BIN" config set subscription "$SUBSCRIPTION" >/dev/null
+    echo "    Subscription: $SUBSCRIPTION"
+  fi
   if [[ -n "${ROUTER_DESC:-}" ]]; then
     "$QQ_BIN" config set router "$ROUTER_DESC" >/dev/null
     echo "    Backed by: $ROUTER_DESC"

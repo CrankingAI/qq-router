@@ -149,3 +149,27 @@ def test_missing_config_file_is_not_an_error(tmp_path):
 def test_config_dir_honours_the_override(tmp_path, monkeypatch):
     monkeypatch.setenv("QQ_CONFIG_DIR", str(tmp_path / "custom"))
     assert config_dir() == tmp_path / "custom"
+
+
+def test_config_get_finds_a_provider_scoped_secret(tmp_path, monkeypatch):
+    """The bug: 'qq config get openrouter_api_key' looked up a Settings
+    attribute that does not exist and reported "(not set)" with a key stored."""
+    from qq.configcmd import _KEY_TO_FIELD, _get
+
+    monkeypatch.setenv("QQ_CONFIG_DIR", str(tmp_path / "qq"))
+    monkeypatch.setenv("QQ_PROVIDER", "openrouter")
+    monkeypatch.setenv("QQ_OPENROUTER_API_KEY", "sk-or-secret")
+    assert _KEY_TO_FIELD["openrouter_api_key"] == "api_key"
+    assert _get("openrouter_api_key") == 0
+
+
+def test_config_get_masks_the_secret_it_finds(tmp_path, monkeypatch, capsys):
+    from qq.configcmd import _get
+
+    monkeypatch.setenv("QQ_CONFIG_DIR", str(tmp_path / "qq"))
+    monkeypatch.setenv("QQ_PROVIDER", "openrouter")
+    monkeypatch.setenv("QQ_OPENROUTER_API_KEY", "sk-or-secret")
+    _get("openrouter_api_key")
+    out = capsys.readouterr().out
+    assert "sk-or-secret" not in out
+    assert "redacted" in out
