@@ -11,9 +11,11 @@ import pytest
 import qq.client as client_module
 from qq.cli import build_parser, detect_subcommand, main, read_stdin
 from qq.client import Answer
-from qq.errors import EXIT_AUTH, EXIT_OK, EXIT_USAGE, AuthError
+from qq.errors import EXIT_AUTH, EXIT_CONFIG, EXIT_OK, EXIT_USAGE, AuthError
 
 SECRET = "azure-api-key-do-not-leak"
+BRAVE_SECRET = "brave-api-key-do-not-leak"
+PROJECT_ENDPOINT = "https://qq-dev-abc.services.ai.azure.com/api/projects/qq-dev"
 
 
 class StubBackend:
@@ -21,6 +23,7 @@ class StubBackend:
 
     last_prompt = None
     last_stream = None
+    last_search = None
     raises = None
 
     def __init__(self, settings):
@@ -34,9 +37,10 @@ class StubBackend:
     def surface(self):
         return self.settings.effective_api
 
-    def ask(self, prompt, *, stream=False, on_delta=None):
+    def ask(self, prompt, *, stream=False, on_delta=None, search=None):
         StubBackend.last_prompt = prompt
         StubBackend.last_stream = stream
+        StubBackend.last_search = search
         if StubBackend.raises is not None:
             raise StubBackend.raises
         text = "A CNAME record aliases one DNS name to another."
@@ -69,6 +73,7 @@ class StubBackend:
 def stub_backend(monkeypatch):
     StubBackend.last_prompt = None
     StubBackend.last_stream = None
+    StubBackend.last_search = None
     StubBackend.raises = None
     monkeypatch.setattr(client_module, "build_backend", StubBackend)
     monkeypatch.setenv("QQ_ENDPOINT", "https://x.openai.azure.com")
@@ -217,16 +222,24 @@ def test_ask_flag_forces_a_question(monkeypatch, capsys):
 
 
 def test_api_flag_selects_the_responses_surface(monkeypatch, capsys):
-    """model-router needs chat completions; --api responses is the opt-out."""
+    """On an account endpoint auto means chat; --api responses overrides it."""
     code, _, _ = run(["--api", "responses", "hi"], monkeypatch, capsys)
     assert code == EXIT_OK
 
 
-def test_default_surface_is_chat_completions(monkeypatch, capsys):
+def test_default_surface_is_chat_completions_on_the_account_endpoint(monkeypatch, capsys):
     from qq.config import resolve
 
     monkeypatch.delenv("QQ_API", raising=False)
     assert resolve().effective_api == "chat"
+
+
+def test_default_surface_is_responses_on_a_project_endpoint(monkeypatch, capsys):
+    from qq.config import resolve
+
+    monkeypatch.delenv("QQ_API", raising=False)
+    monkeypatch.setenv("QQ_ENDPOINT", PROJECT_ENDPOINT)
+    assert resolve().effective_api == "responses"
 
 
 def test_repeated_v_raises_the_tier(monkeypatch, capsys):
@@ -271,3 +284,70 @@ def test_verbose_defaults_to_off(monkeypatch, capsys):
 def test_the_v_line_names_the_backend(monkeypatch, capsys):
     _, _out, err = run(["-v", "hi"], monkeypatch, capsys)
     assert err.splitlines()[0].startswith("[provider=azure ")
+
+
+# --- --search ----------------------------------------------------------------
+
+
+def test_search_is_off_unless_asked_for(monkeypatch, capsys):
+    run(["hi"], monkeypatch, capsys)
+    assert StubBackend.last_search is None
+
+
+def test_search_flag_reaches_the_backend_as_a_tool(monkeypatch, capsys):
+    from qq.search import WebSearch
+
+    monkeypatch.setenv("QQ_ENDPOINT", PROJECT_ENDPOINT)
+    monkeypatch.setenv("QQ_BRAVE_API_KEY", BRAVE_SECRET)
+    code, out, err = run(["--search", "newest", "python"], monkeypatch, capsys)
+    assert code == EXIT_OK
+    assert isinstance(StubBackend.last_search, WebSearch)
+    assert err == ""
+    assert BRAVE_SECRET not in out
+
+
+def test_search_from_the_environment_can_be_switched_off_per_call(monkeypatch, capsys):
+    monkeypatch.setenv("QQ_ENDPOINT", PROJECT_ENDPOINT)
+    monkeypatch.setenv("QQ_BRAVE_API_KEY", BRAVE_SECRET)
+    monkeypatch.setenv("QQ_SEARCH", "true")
+    run(["hi"], monkeypatch, capsys)
+    assert StubBackend.last_search is not None
+    run(["--no-search", "hi"], monkeypatch, capsys)
+    assert StubBackend.last_search is None
+
+
+def test_search_without_a_brave_key_fails_before_any_request(monkeypatch, capsys):
+    monkeypatch.setenv("QQ_ENDPOINT", PROJECT_ENDPOINT)
+    monkeypatch.delenv("BRAVE_API_KEY", raising=False)
+    monkeypatch.delenv("QQ_BRAVE_API_KEY", raising=False)
+    code, out, err = run(["--search", "hi"], monkeypatch, capsys)
+    assert code == EXIT_CONFIG
+    assert out == ""
+    assert "brave_api_key" in err
+    assert StubBackend.last_prompt is None
+
+
+def test_search_on_the_account_endpoint_explains_the_project_endpoint(monkeypatch, capsys):
+    """model-router only takes tools through a project endpoint; say so."""
+    monkeypatch.setenv("QQ_BRAVE_API_KEY", BRAVE_SECRET)
+    code, _out, err = run(["--search", "hi"], monkeypatch, capsys)
+    assert code == EXIT_CONFIG
+    assert "api/projects" in err
+    assert BRAVE_SECRET not in err
+
+
+def test_search_with_chat_forced_is_refused(monkeypatch, capsys):
+    monkeypatch.setenv("QQ_ENDPOINT", PROJECT_ENDPOINT)
+    monkeypatch.setenv("QQ_BRAVE_API_KEY", BRAVE_SECRET)
+    code, _out, err = run(["--search", "--api", "chat", "hi"], monkeypatch, capsys)
+    assert code == EXIT_CONFIG
+    assert "Responses" in err
+
+
+def test_search_diagnostics_never_leak_the_brave_key(monkeypatch, capsys):
+    monkeypatch.setenv("QQ_ENDPOINT", PROJECT_ENDPOINT)
+    monkeypatch.setenv("QQ_BRAVE_API_KEY", BRAVE_SECRET)
+    for flag in ("-v", "-vv", "-vvv"):
+        _, out, err = run([flag, "--search", "hi"], monkeypatch, capsys)
+        assert BRAVE_SECRET not in out
+        assert BRAVE_SECRET not in err

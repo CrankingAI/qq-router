@@ -13,6 +13,10 @@ param environment = 'dev'
 param location = 'eastus2'
 
 param routerDeploymentName = 'qq-router'
+
+// The Foundry project whose endpoint qq calls. Leave it out to default to
+// <namePrefix>-<environment>.
+param projectName = 'qq-dev'
 param routingMode = 'balanced'
 param routerCapacity = 10
 param routerModelVersion = '2025-11-18'

@@ -1,19 +1,46 @@
 # TODO / to finish
 
-State as of 2026-09-14. Everything below is either a decision the maintainer
+State as of 2026-09-15. Everything below is either a decision the maintainer
 still has to make, or a known gap. Nothing here blocks daily use: both backends
-work end to end, 151 tests pass, CI is green.
+work end to end, 211 tests pass, CI is green.
 
 ## Decisions to make
 
 These are choices, not bugs. Each has a recommendation, but the call is yours.
 
-### 1. Web search
+### 1. Web search — done, 2026-09-15
 
-The biggest open question. Neither backend searches today; `qq` sends one plain
-chat request with no tools.
+Shipped as `--search`: Brave Search offered to the model as a function tool on
+the Responses API, on both backends. The model decides whether to search and
+writes its own query; at most two rounds, then it must answer; a `Sources:`
+line on searched answers; off by default; `search=` at `-v`, the queries at
+`-vv`. Measured: a question that triggered two searches took 8-9s and ~1,500
+input tokens over three requests; one that triggered none made one request,
+searched nothing, and paid ~300 extra input tokens for the tool definition and
+the search rules (500 in against 200 unsearched).
 
-Four ways to add it, in rough order of how little they change `qq`:
+What changed in the analysis. The table below used to say Azure could not do
+row two because `model-router` rejects the Responses API. That was too broad.
+It rejects it **on the account endpoint** (`*.openai.azure.com`: still HTTP 400,
+and the management-plane capability list agrees, `chatCompletion` and `router`
+with no `responses`). Through a Foundry **project** endpoint
+(`*.services.ai.azure.com/api/projects/<name>`) the router accepts Responses,
+tools included, and Microsoft's own how-to shows exactly that call. So the fix
+was one child resource: `infra/modules/ai.bicep` now creates a project,
+`deploy.sh` prints its endpoint, `setup-cli.sh` records it as `endpoint`, and
+`qq` picks Responses on a project endpoint and Chat Completions on an account
+endpoint by itself.
+
+Row four (client-side function calling) is what got built, not row one. A
+search that runs on every question was measured to cost 3-4x the tokens and
+change nothing on the README's own examples; letting the model decide removed
+that tax. Still open: whether `search = true` should become the default once
+there is data on how often the model searches when it should not. Also noted:
+OpenRouter's credit pre-check returned 402 "requires more credits or fewer
+max_tokens" for `cost_tier` plus tools on a low balance; that is the balance,
+not a compatibility problem.
+
+The original analysis, kept for the record:
 
 | Approach | Loop in qq | New state | Keeps the router |
 |---|---|---|---|
@@ -35,7 +62,9 @@ default. Never row three or four for a tool whose pitch is disposable questions.
 
 Not implemented. About ten tokens. Removes a class of confidently wrong "as of"
 answers; the Azure model guessed the date correctly once, unprompted, which is
-luck rather than design. Recommended regardless of the search decision.
+luck rather than design. More relevant now that search exists: the tool's rule
+is "search when the answer may have changed since your training data", and a
+model that knows today's date judges that better.
 
 ### 3. Always-on verbosity
 
@@ -78,11 +107,12 @@ current output.
 
 ### Verified against the live service
 
-- **`model-router` and the Responses API.** Microsoft's docs show the router
-  on the Responses API. Against this resource it returns `400 The requested
-  operation is unsupported`, on every host and every region checked. Chat
-  Completions is the default for that reason. Worth re-checking after a
-  service update; the router's capability list is the tell.
+- **`model-router` and the Responses API.** On the account endpoint it returns
+  `400 The requested operation is unsupported`, on every host and region
+  checked, and the capability list shows `chatCompletion` and `router` without
+  `responses`. Through a Foundry project endpoint it works, tools included
+  (verified 2026-09-15 against `qq-dev`). `Settings.effective_api` chooses by
+  endpoint. Worth re-checking the account route after a service update.
 - **Azure CLI account drift.** The CLI's default account changed twice during
   development, once to an unrelated tenant. `qq` now pins the subscription so
   it asks for the right account regardless. Configs written before this need
@@ -106,7 +136,8 @@ current output.
 ### Cost figures not available
 
 - Azure does not publish a per-call price for the `web_search` tool. It defers
-  to the Bing APIs pricing page.
+  to the Bing APIs pricing page. Moot for now: `--search` uses Brave, priced
+  per query on your Brave plan, and no Bing resource exists.
 
 ### Polish
 

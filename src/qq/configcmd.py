@@ -93,6 +93,8 @@ def _show() -> int:
             "openrouter key" if settings.effective_provider == "openrouter" else "api key",
             settings.api_key,
         ),
+        ("search", "on" if settings.search else "off"),
+        ("brave key", settings.brave_api_key),
         ("timeout", settings.timeout),
     ]
     width = max(len(name) for name, _ in rows)
@@ -105,6 +107,7 @@ def _show() -> int:
             "api surface": "api",
             "cost tier": "cost_tier",
             "allowed models": "allowed_models",
+            "brave key": "brave_api_key",
         }.get(name, name)
         source = settings.sources.get(key, "")
         suffix = f"   [{source}]" if source and source != "default" else ""

@@ -133,16 +133,18 @@ def test_missing_key_fails_with_a_hint_pointing_at_the_key_page():
 
 
 class ORUsage:
+    """Responses-shaped usage, with OpenRouter's inline cost as an extra."""
+
     def __init__(self, prompt, completion, cost=None):
-        self.prompt_tokens = prompt
-        self.completion_tokens = completion
+        self.input_tokens = prompt
+        self.output_tokens = completion
         self.model_extra = {"cost": cost} if cost is not None else {}
 
 
 def or_response(text="hi", model="anthropic/claude-sonnet-4.5", usage=None, metadata=None):
-    message = types.SimpleNamespace(content=text)
     response = types.SimpleNamespace(
-        choices=[types.SimpleNamespace(message=message)],
+        output_text=text,
+        output=[],
         model=model,
         usage=usage,
         id="gen-abc123",
@@ -164,15 +166,20 @@ METADATA = {
 
 
 def _ask(backend, response):
-    class FakeCompletions:
+    """Round-trip one question on the default (Responses) surface."""
+
+    class FakeResponses:
         def create(self, **kwargs):
             backend.last_kwargs = kwargs
             return response
 
-    backend._cached = types.SimpleNamespace(
-        chat=types.SimpleNamespace(completions=FakeCompletions())
-    )
+    backend._cached = types.SimpleNamespace(responses=FakeResponses())
     return backend.ask("why is this broken")
+
+
+def test_openrouter_defaults_to_the_responses_surface():
+    assert OpenRouterBackend(settings()).surface == "responses"
+    assert OpenRouterBackend(settings(api="chat")).surface == "chat"
 
 
 def test_cost_and_routing_metadata_reach_the_answer():
@@ -233,7 +240,7 @@ def test_cost_appears_at_level_two_and_upstream_at_level_three():
 def test_an_error_body_behind_a_200_is_raised_not_swallowed():
     """OpenRouter answers 200 before the upstream provider has succeeded."""
     backend = OpenRouterBackend(settings())
-    broken = types.SimpleNamespace(choices=[], model=None, usage=None, id="gen-x")
+    broken = types.SimpleNamespace(output=[], model=None, usage=None, id="gen-x")
     broken.model_extra = {
         "error": {
             "code": 429,
@@ -250,7 +257,8 @@ def test_an_error_body_behind_a_200_is_raised_not_swallowed():
 
 
 def test_a_mid_stream_error_chunk_is_raised():
-    backend = OpenRouterBackend(settings())
+    """Chat Completions is still available on request, trap included."""
+    backend = OpenRouterBackend(settings(api="chat"))
     good = types.SimpleNamespace(
         choices=[types.SimpleNamespace(delta=types.SimpleNamespace(content="par"))],
         model="openai/gpt-5-nano",
@@ -376,3 +384,46 @@ def test_azure_still_reports_its_tenant():
     }
     backend = AzureFoundryBackend(resolve(env={}, file_values=stored))
     assert backend.tenant_label == "00000000-1111-2222-3333-444444444444"
+
+
+# --- several requests per question ------------------------------------------
+
+
+def test_cost_is_summed_across_search_rounds():
+    """A --search question is two or three requests; report what all of them cost."""
+    import io
+    import json
+
+    from qq.search import WebSearch
+
+    class Body(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+    def opener(request, timeout=None):
+        return Body(json.dumps({"web": {"results": []}}).encode())
+
+    call = types.SimpleNamespace(
+        type="function_call", call_id="c1", name="brave_search", arguments='{"query": "x"}'
+    )
+    first = types.SimpleNamespace(
+        output_text="", output=[call], model="m", usage=ORUsage(10, 5, cost=0.0001), id="gen-1"
+    )
+    first.model_extra = {}
+    second = or_response("answer", usage=ORUsage(20, 7, cost=0.0003))
+    script = iter([first, second])
+
+    class FakeResponses:
+        def create(self, **kwargs):
+            return next(script)
+
+    backend = OpenRouterBackend(settings())
+    backend._cached = types.SimpleNamespace(responses=FakeResponses())
+    answer = backend.ask("q", search=WebSearch("k", opener=opener))
+
+    assert answer.text == "answer"
+    assert answer.cost == pytest.approx(0.0004)
+    assert (answer.input_tokens, answer.output_tokens) == (30, 12)

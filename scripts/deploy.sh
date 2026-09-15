@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# deploy.sh — Provision the Azure AI Foundry account and model-router for qq
+# deploy.sh — Provision the Foundry account, model-router and project for qq
 #
 # Usage:
 #   ./scripts/deploy.sh
@@ -22,6 +22,7 @@ ENV_NAME="dev"
 LOCATION="eastus2"
 NAME_PREFIX="qq"
 ROUTER_NAME="qq-router"
+PROJECT_NAME=""
 ROUTING_MODE="balanced"
 ROUTER_CAPACITY="10"
 SUBSCRIPTION=""
@@ -32,7 +33,7 @@ usage() {
   cat <<EOF
 Usage: $(basename "$0") [options]
 
-Provision the Azure AI Foundry account and model-router deployment that qq talks to.
+Provision the Foundry account, model-router deployment and project that qq talks to.
 Lifecycle: routine — safe to re-run; use --dry-run to preview.
 
 Options:
@@ -40,6 +41,7 @@ Options:
   --location <region>     Azure region (default: $LOCATION)
   --name-prefix <prefix>  Resource name prefix (default: $NAME_PREFIX)
   --deployment <name>     Model-router deployment name (default: $ROUTER_NAME)
+  --project <name>        Foundry project name (default: <prefix>-<env>)
   --routing-mode <mode>   balanced | cost | quality (default: $ROUTING_MODE)
   --capacity <n>          Capacity in thousands of TPM (default: $ROUTER_CAPACITY)
   --subscription <id>     Azure subscription (default: the current az subscription)
@@ -69,6 +71,7 @@ while [[ $# -gt 0 ]]; do
     --location)      LOCATION="${2:?--location needs a value}"; shift 2 ;;
     --name-prefix)   NAME_PREFIX="${2:?--name-prefix needs a value}"; shift 2 ;;
     --deployment)    ROUTER_NAME="${2:?--deployment needs a value}"; shift 2 ;;
+    --project)       PROJECT_NAME="${2:?--project needs a value}"; shift 2 ;;
     --routing-mode)  ROUTING_MODE="${2:?--routing-mode needs a value}"; shift 2 ;;
     --capacity)      ROUTER_CAPACITY="${2:?--capacity needs a value}"; shift 2 ;;
     --subscription)  SUBSCRIPTION="${2:?--subscription needs a value}"; shift 2 ;;
@@ -126,6 +129,7 @@ echo "    Subscription:   $SUB_NAME ($SUBSCRIPTION)"
 echo "    Resource group: $RESOURCE_GROUP"
 echo "    Location:       $LOCATION"
 echo "    Router:         $ROUTER_NAME (mode=$ROUTING_MODE capacity=$ROUTER_CAPACITY)"
+echo "    Project:        ${PROJECT_NAME:-${NAME_PREFIX}-${ENV_NAME}}"
 
 echo "==> Checking model-router availability in $LOCATION..."
 MODELS_JSON="$(az cognitiveservices model list \
@@ -220,6 +224,9 @@ PARAMS=(
 if [[ -n "$PRINCIPAL_ID" ]]; then
   PARAMS+=("principalId=$PRINCIPAL_ID")
 fi
+if [[ -n "$PROJECT_NAME" ]]; then
+  PARAMS+=("projectName=$PROJECT_NAME")
+fi
 
 if [[ "$DRY_RUN" == true ]]; then
   echo "==> Dry run (what-if)..."
@@ -249,6 +256,7 @@ OUTPUTS="$(az deployment sub create \
   -o json)"
 
 ENDPOINT="$(echo "$OUTPUTS" | jq -r '.endpoint.value')"
+PROJECT_ENDPOINT="$(echo "$OUTPUTS" | jq -r '.projectEndpoint.value')"
 ACCOUNT="$(echo "$OUTPUTS" | jq -r '.accountName.value')"
 ROUTER="$(echo "$OUTPUTS" | jq -r '.routerDeploymentName.value')"
 RG_OUT="$(echo "$OUTPUTS" | jq -r '.resourceGroupName.value')"
@@ -290,11 +298,12 @@ cat <<EOF
 
 ==> Deployed
 
-    Resource group:   $RG_OUT
-    Foundry account:  $ACCOUNT
-    Endpoint:         $ENDPOINT
+    Resource group:    $RG_OUT
+    Foundry account:   $ACCOUNT
+    Project endpoint:  $PROJECT_ENDPOINT
+    Account endpoint:  $ENDPOINT   (the router speaks Chat Completions only here)
     Router deployment: $ROUTER
-    Routing mode:     $ROUTING_MODE
+    Routing mode:      $ROUTING_MODE
 
 Next:
 
@@ -302,8 +311,10 @@ Next:
 
 That installs the qq command and writes your local config. Or configure by hand:
 
-    export QQ_ENDPOINT="$ENDPOINT"
+    export QQ_ENDPOINT="$PROJECT_ENDPOINT"
     export QQ_DEPLOYMENT="$ROUTER"
+
+For 'qq --search', also export BRAVE_API_KEY or run: qq config set brave_api_key '<key>'
 
 No API key is printed here on purpose. qq prefers Microsoft Entra ID; run
 'az login' and you are done. If you want key auth instead, see the README.

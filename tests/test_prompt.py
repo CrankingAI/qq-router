@@ -50,3 +50,15 @@ def test_truncate_keeps_the_tail_because_errors_live_there():
 def test_short_stdin_is_untouched():
     clipped, was_truncated = truncate_stdin("small")
     assert (clipped, was_truncated) == ("small", False)
+
+
+def test_search_rules_are_only_added_when_search_is_on():
+    from qq.prompt import SYSTEM_INSTRUCTION, system_instruction
+
+    assert system_instruction() == SYSTEM_INSTRUCTION
+    assert system_instruction(False) == SYSTEM_INSTRUCTION
+    with_search = system_instruction(True)
+    assert with_search.startswith(SYSTEM_INSTRUCTION)
+    assert "brave_search" in with_search
+    assert "Sources:" in with_search
+    assert "untrusted" in with_search

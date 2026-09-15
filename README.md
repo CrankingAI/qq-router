@@ -14,7 +14,9 @@ picks a cheap model for easy questions and a stronger one for hard ones, so you
 do not have to think about which model to use.
 
 Two backends, same idea: **Azure AI Foundry Model Router** (the default) and
-**OpenRouter**.
+**OpenRouter**. Add `--search` and the model may look things up on the web
+before answering, but only when it decides the answer could have changed since
+its training data.
 
 ```console
 $ qq how do I list all my github repos
@@ -33,13 +35,15 @@ Answers go to stdout, diagnostics to stderr, so `qq` composes in a pipeline.
 ## Architecture
 
 Deliberately tiny. There is no API, no gateway, no database, no Key Vault, and
-no proxy. The CLI calls Azure directly.
+no proxy. The CLI calls Azure directly, and Brave directly when you ask it to
+search.
 
 ```mermaid
 flowchart TD
     T["terminal"] --> Q["qq CLI<br/>(local Python tool)"]
-    Q -->|"HTTPS + Entra ID or API key"| F["Azure AI Foundry<br/>/openai/v1"]
-    Q -.->|"HTTPS + API key"| O["OpenRouter<br/>/api/v1"]
+    Q -->|"HTTPS + Entra ID or API key<br/>Responses API"| F["Foundry project endpoint<br/>/api/projects/qq-dev/openai/v1"]
+    Q -.->|"HTTPS + API key<br/>Responses API"| O["OpenRouter<br/>/api/v1"]
+    Q -.->|"--search only<br/>HTTPS + API key"| B["Brave Search API"]
 
     F --> R["model-router deployment<br/>mode: balanced"]
     R -->|simple question| L["gpt-5.6-luna"]
@@ -61,11 +65,17 @@ flowchart TD
         A
         M
     end
+    subgraph Brave["Brave (a key is the whole setup)"]
+        B
+    end
 ```
 
 On Azure the whole server side is one `Microsoft.CognitiveServices/accounts`
-resource of kind `AIServices` plus one `model-router` deployment on it. On
-OpenRouter there is nothing to provision at all: an API key is the entire setup.
+resource of kind `AIServices`, one `model-router` deployment on it, and one
+Foundry project on it. The project is what lets `qq` talk to the router over
+the Responses API; see [Which API surface](#which-api-surface). On OpenRouter
+there is nothing to provision at all: an API key is the entire setup. Web search
+is the same story: a Brave key, nothing else.
 
 ## Prerequisites
 
@@ -76,6 +86,7 @@ OpenRouter there is nothing to provision at all: an API key is the entire setup.
 | [`jq`](https://jqlang.github.io/jq/) | the scripts parse JSON | `brew install jq` |
 | [`uv`](https://docs.astral.sh/uv/) or [`pipx`](https://pipx.pypa.io/) | installs `qq` in its own environment | `brew install uv` |
 | Python 3.11+ | provided by uv/pipx if you lack it | `brew install python` |
+| [Brave Search API](https://api-dashboard.search.brave.com/) key | only for `--search` | sign up, copy the key |
 
 You need permission to create a resource group and a Cognitive Services account
 in the target subscription. Granting yourself the inference role additionally
@@ -115,6 +126,7 @@ The deployment is idempotent: re-running converges the same resources.
 | `rg-qq-dev` | resource group |
 | `qq-dev-<hash>` | Foundry account, `kind: AIServices`, SKU `S0` |
 | `qq-router` | `model-router` deployment, `GlobalStandard`, capacity 10 |
+| `qq-dev` | Foundry project on the account; its endpoint is what `qq` calls |
 
 ### Parameters
 
@@ -127,6 +139,7 @@ is gitignored), or pass `--parameters` yourself.
 | `environment` | `dev` | name suffix and tag |
 | `location` | `eastus2` | must support model-router |
 | `routerDeploymentName` | `qq-router` | what `qq` sends as the model id |
+| `projectName` | `qq-dev` | Foundry project on the account; `qq` calls its endpoint |
 | `routingMode` | `balanced` | `balanced`, `cost`, or `quality` |
 | `routerModelVersion` | `2025-11-18` | Microsoft updates this version in place |
 | `routerCapacity` | `10` | thousands of tokens per minute |
@@ -161,7 +174,7 @@ Installing by hand instead:
 
 ```bash
 uv tool install git+https://github.com/CrankingAI/qq-router
-qq config set endpoint https://<your-resource>.openai.azure.com
+qq config set endpoint https://<account>.services.ai.azure.com/api/projects/<project>
 qq config set deployment qq-router
 qq config set tenant "$(az account show --query tenantId -o tsv)"
 ```
@@ -232,6 +245,7 @@ qq -v what is a CNAME                         # model and latency on stderr
 qq -vv what is a CNAME                        # plus connection and request context
 qq -vvv what is a CNAME                       # plus server-side timing breakdown
 qq --model gpt-5.6-sol explain TCP slow start # bypass the router
+qq --search what is the newest stable Python release   # let the model look it up
 qq --version
 qq --help
 ```
@@ -271,34 +285,90 @@ qq config path
 looks like one. `qq doctor who wrote this` is a question. Force it with
 `qq --ask doctor`.
 
+### Web search
+
+```bash
+qq --search what is the newest stable Python release
+qq --search -vv what is the current Node.js LTS
+qq config set search true        # always offer the tool
+qq --no-search what is a CNAME   # and switch it off for one question
+```
+
+`--search` does not search. It offers the model a `brave_search` tool and lets
+the model decide. A question about a command or a stable concept is answered
+straight away, with no search and no extra cost. A question about a version, a
+date, a price or who currently holds a role makes the model write its own query
+(usually a better one than you typed), read the top five results, and answer
+with a `Sources:` line. It may search at most twice per question; after that it
+has to answer with what it found.
+
+```console
+$ qq --search -vv what is the newest stable Python release
+Python 3.14.7 — released August 5, 2026.
+
+Sources: https://www.python.org/downloads/release/python-3147/
+[provider=azure deployment=qq-router model=gpt-5.6-terra-2026-07-09 latency=9.21s tokens=1572in/223out search=2]
+[router=model-router:2025-11-18 host=qq-dev-abc.services.ai.azure.com api=responses auth=entra stream=off request=resp_0a2 search_query="site:python.org/downloads/ latest stable Python release"|"site:python.org/downloads/release \"Python 3.14\" release date" search_latency=1.58s]
+```
+
+It needs two things: a [Brave Search API](https://api-dashboard.search.brave.com/)
+key (`BRAVE_API_KEY`, `QQ_BRAVE_API_KEY`, or `qq config set brave_api_key`), and
+the Responses API, which on Azure means the project endpoint that `deploy.sh`
+creates and `setup-cli.sh` records. `qq doctor` checks both and runs one Brave
+query.
+
+What it costs: the question above ran three requests, about 1,500 input tokens
+and nine seconds, against 200 tokens and three seconds unsearched. A question
+that triggers no search makes one request and no Brave call, but still pays
+for the tool definition and the search rules in the system prompt: about 300
+extra input tokens (500 against 200 on the GitHub example). Brave bills per
+query on its own plan.
+
+Search results are text from the open web, and `qq` answers are commands you
+are about to paste into a shell. The results reach the model as tool output and
+the system prompt says to treat them as evidence rather than instructions, but
+read a searched answer before you run it, and leave search off by default, which
+is what `qq` does. See [SECURITY.md](SECURITY.md).
+
 ## Configuration
 
-Precedence, highest first: flags, `QQ_*` environment variables,
-`AZURE_OPENAI_*` environment variables, the config file, built-in defaults.
+Precedence, highest first: flags, `QQ_*` environment variables, the config
+file, generic environment variables (`AZURE_OPENAI_ENDPOINT`,
+`AZURE_OPENAI_API_KEY`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`,
+`OPENROUTER_API_KEY`, `BRAVE_API_KEY`), built-in defaults.
 
 | Variable | Config key | Default | Meaning |
 |---|---|---|---|
-| `QQ_ENDPOINT` | `endpoint` | — | Foundry endpoint; `/openai/v1` is appended for you |
+| `QQ_ENDPOINT` | `endpoint` | — | Foundry project endpoint (or account endpoint); `/openai/v1` is appended for you |
 | `QQ_DEPLOYMENT` | `deployment` | `qq-router` | router deployment name |
 | `QQ_API_KEY` | `api_key` | — | API key; leave unset to use Entra ID |
 | `QQ_AUTH` | `auth` | `auto` | `auto`, `entra`, or `key` |
 | `QQ_TENANT_ID` | `tenant` | — | Entra tenant owning the resource |
 | `QQ_MODEL` | `model` | — | address a deployment directly |
-| `QQ_API` | `api` | `auto` | `auto`, `chat`, or `responses` |
+| `QQ_API` | `api` | `auto` | `auto` (see [below](#which-api-surface)), `chat`, or `responses` |
 | `QQ_ROUTER` | `router` | — | what the Azure deployment is backed by, shown at `-vv` |
 | `QQ_PROVIDER` | `provider` | `azure` | `azure` or `openrouter` |
 | `QQ_OPENROUTER_API_KEY` | `openrouter_api_key` | — | OpenRouter key; `OPENROUTER_API_KEY` also works |
 | — | `openrouter_model` | `openrouter/auto` | OpenRouter model slug |
 | `QQ_COST_TIER` | `cost_tier` | — | `low`, `medium`, `high`, `xhigh`, `max` |
 | `QQ_ALLOWED_MODELS` | `allowed_models` | — | comma-separated patterns the auto-router may pick from |
+| `QQ_SEARCH` | `search` | `false` | offer the model the Brave search tool |
+| `QQ_BRAVE_API_KEY` | `brave_api_key` | — | Brave Search key; `BRAVE_API_KEY` also works |
 | `QQ_TIMEOUT` | `timeout` | `60` | request timeout in seconds |
 | `QQ_CONFIG_DIR` | — | OS default | override the config directory |
 | `QQ_NO_STREAM` | — | — | disable streaming |
 | `QQ_NO_TOKEN_CACHE` | — | — | disable the Entra token cache |
 | `QQ_OTEL` | — | — | `1` enables OpenTelemetry tracing |
 
-`AZURE_OPENAI_ENDPOINT` and `AZURE_OPENAI_API_KEY` are honoured as fallbacks so
-an existing Azure setup works with no extra configuration.
+The generic variables are honoured so an existing Azure or OpenRouter setup
+works with no configuration at all, but they sit *below* the config file: once
+`setup-cli.sh` has written your endpoint, a stale `AZURE_OPENAI_ENDPOINT` in a
+shell profile cannot redirect `qq`. To override deliberately, use `QQ_ENDPOINT`
+or a flag; `qq config show` always says where each value came from. One
+pairing rule: `AZURE_OPENAI_API_KEY` is used only together with
+`AZURE_OPENAI_ENDPOINT`, never against an endpoint from the config file, so a
+key exported for some other resource cannot be sent to yours or quietly turn
+Entra off.
 
 The config file lives at `~/.config/qq/config.toml` on macOS and Linux
 (`%APPDATA%\qq\config.toml` on Windows), mode `0600` in a `0700` directory.
@@ -309,17 +379,18 @@ Azure deployment name.
 
 ### Which API surface
 
-`qq` defaults to Chat Completions. That is not nostalgia: as of September 2026
-the `model-router` model advertises only the `chatCompletion` capability in
-every region, and calling `/openai/v1/responses` against a router deployment
-returns `400 The requested operation is unsupported`. Direct model deployments
-such as `gpt-5.6-luna` do support Responses, so `--api responses` is available
-for those. Check for yourself:
+`qq` uses the Responses API wherever it works and Chat Completions where it does
+not, and `auto` (the default) works that out from the endpoint:
 
-```bash
-az cognitiveservices model list --location eastus2 \
-  --query "[?model.name=='model-router'].model.capabilities" -o json
-```
+| Backend and endpoint | `auto` means | Why |
+|---|---|---|
+| Azure, project endpoint (`…/api/projects/<name>`) | `responses` | the router accepts Responses here, tools included |
+| Azure, account endpoint (`…openai.azure.com`) | `chat` | `model-router` answers `400 The requested operation is unsupported` to `/responses` on this route, and its capability list agrees: `chatCompletion` and `router`, no `responses` |
+| OpenRouter | `responses` | supported, with the auto-router plugin and inline cost unchanged |
+
+`--search` needs Responses, because that is where the tool loop lives. Direct
+model deployments such as `gpt-5.6-luna` support Responses on either Azure
+route. Override with `--api chat` or `--api responses` whenever you want to.
 
 Both surfaces report the model that actually served the request, which is what
 `--verbose` prints. `qq` never guesses the routed model.
@@ -363,8 +434,8 @@ acquisition or TLS setup, rather than at the model.
 
 | Level | Shows |
 |---|---|
-| `-v` | backend, routed model, latency, token counts |
-| `-vv` | router identity, host, API surface, auth mode, streaming, cost, request id |
+| `-v` | backend, routed model, latency, token counts; with `--search`, how many searches ran |
+| `-vv` | router identity, host, API surface, auth mode, streaming, cost, request id; with `--search`, the queries and their latency |
 | `-vvv` | server-side timing breakdown, serving replica, cached and reasoning tokens, token cache state, tenant, client overhead |
 
 Every level goes to stderr, so `qq` still composes:
@@ -436,7 +507,7 @@ or stay with one vendor.
 $ qq --provider openrouter -vvv what is a CNAME
 A CNAME record aliases one DNS name to another...
 [provider=openrouter deployment=openrouter/auto model=anthropic/claude-sonnet-4.5 latency=1.84s tokens=15in/150out]
-[router=openrouter/auto:low host=openrouter.ai api=chat auth=key stream=off cost=$0.000123 request=gen-abc123]
+[router=openrouter/auto:low host=openrouter.ai api=responses auth=key stream=off cost=$0.000123 request=gen-abc123]
 [detail upstream=Anthropic strategy=auto task=qa_knowledge token_cache=n/a overhead=0.31s]
 ```
 
@@ -465,6 +536,10 @@ costs more; that is what the 100,000 character cap is for.
 
 `routingMode` is the cost lever. `cost` biases toward cheaper models, `quality`
 toward stronger ones, `balanced` sits between.
+
+`--search` adds Brave's per-query price on your Brave plan, and two or three
+model requests instead of one when the model does search; measured numbers are
+in [Web search](#web-search). The Foundry project itself has no charge.
 
 The router does move between models, though the three default `gpt-5.6-*`
 models are close enough in capability that you have to look for it. A factual

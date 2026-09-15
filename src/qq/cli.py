@@ -21,7 +21,7 @@ import sys
 from collections.abc import Sequence
 
 from . import __version__
-from .errors import EXIT_INTERRUPT, EXIT_OK, EXIT_USAGE, QQError, UsageError
+from .errors import EXIT_INTERRUPT, EXIT_OK, EXIT_USAGE, ConfigError, QQError, UsageError
 from .prompt import build_prompt, join_args, truncate_stdin
 
 PROGRAM = "qq"
@@ -36,6 +36,7 @@ examples:
   cat error.txt | qq explain this error
   qq --verbose what is a CNAME
   qq -vvv what is a CNAME          # full server-side timing breakdown
+  qq --search what is the newest stable Python release
 
 subcommands:
   qq config [show|set KEY VALUE|unset KEY|path]
@@ -91,8 +92,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--api",
         choices=("auto", "chat", "responses"),
         help=(
-            "API surface (default: auto, which uses chat completions; "
-            "model-router does not support the responses API)"
+            "API surface (default: auto: responses on OpenRouter and on a Foundry "
+            "project endpoint, chat completions for model-router on an account endpoint)"
         ),
     )
     parser.add_argument(
@@ -112,6 +113,23 @@ def build_parser() -> argparse.ArgumentParser:
         dest="stream",
         action="store_false",
         help="wait for the whole answer before printing",
+    )
+    search = parser.add_mutually_exclusive_group()
+    search.add_argument(
+        "--search",
+        dest="search",
+        action="store_true",
+        default=None,
+        help=(
+            "let the model search the web (Brave) when it thinks the answer may have "
+            "changed since its training data; needs the Responses API and a Brave key"
+        ),
+    )
+    search.add_argument(
+        "--no-search",
+        dest="search",
+        action="store_false",
+        help="never search, even if the config file says so",
     )
     parser.add_argument(
         "--ask",
@@ -179,6 +197,23 @@ def _should_stream(explicit: bool | None) -> bool:
         return False
 
 
+def _web_search(settings):
+    """Build the search tool, or say precisely why it cannot be used."""
+    from .search import WebSearch
+
+    if settings.effective_api != "responses":
+        if settings.effective_provider == "azure" and not settings.is_project_endpoint:
+            hint = (
+                "model-router only accepts the Responses API through a Foundry project "
+                "endpoint. Re-run ./scripts/setup-cli.sh, or set the endpoint to "
+                "https://<account>.services.ai.azure.com/api/projects/<project>."
+            )
+        else:
+            hint = "Drop '--api chat' (or QQ_API=chat); search needs the Responses API."
+        raise ConfigError("--search needs the Responses API", hint=hint)
+    return WebSearch(settings.brave_api_key)
+
+
 def run_query(args: argparse.Namespace, stdin_text: str | None) -> int:
     from .client import build_backend
     from .config import resolve
@@ -204,17 +239,19 @@ def run_query(args: argparse.Namespace, stdin_text: str | None) -> int:
         api=args.api,
         provider=args.provider,
         cost_tier=args.cost_tier,
+        search=args.search,
         timeout=args.timeout,
     )
     backend = build_backend(settings)
+    web = _web_search(settings) if settings.search else None
 
     streaming = _should_stream(args.stream)
     if streaming:
-        answer = backend.ask(prompt, stream=True, on_delta=_out)
+        answer = backend.ask(prompt, stream=True, on_delta=_out, search=web)
         if not answer.text.endswith("\n"):
             _out("\n")
     else:
-        answer = backend.ask(prompt)
+        answer = backend.ask(prompt, search=web)
         _out(answer.text + "\n")
 
     if args.verbose:

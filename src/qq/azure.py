@@ -4,15 +4,23 @@ Holds everything that is specific to Azure: the Entra ID credential chain, the
 token audience, and the client construction. The request and response handling
 lives in :mod:`qq.client` and is shared with every other provider.
 
-**Why Chat Completions is the default.** As of September 2026 the
-``model-router`` model advertises only the ``chatCompletion`` capability in
-every region, and calling ``/openai/v1/responses`` against a router deployment
-returns ``400 The requested operation is unsupported``. Direct model
-deployments such as ``gpt-5.6-luna`` do support Responses, so ``--api responses``
-is available for those. Check what a model supports with::
+**Which endpoint, which API.** A Foundry account publishes two OpenAI-compatible
+routes, and they are not equivalent for a ``model-router`` deployment:
 
-    az cognitiveservices model list --location eastus2 \
-      --query "[?model.name=='model-router'].model.capabilities" -o json
+* The account endpoint, ``https://<account>.openai.azure.com/openai/v1``,
+  speaks Chat Completions to the router. Calling ``/responses`` there returns
+  ``400 The requested operation is unsupported``, and the router's capability
+  list on the management plane agrees: ``chatCompletion`` and ``router``, no
+  ``responses`` (verified September 2026, every region).
+* The project endpoint,
+  ``https://<account>.services.ai.azure.com/api/projects/<project>/openai/v1``,
+  accepts both, including the Responses API with tools, which is what
+  ``--search`` needs. It is what ``deploy.sh`` provisions and
+  ``setup-cli.sh`` records.
+
+``Settings.effective_api`` picks Responses on a project endpoint and Chat
+Completions on an account endpoint, so either configuration works. Direct
+model deployments such as ``gpt-5.6-luna`` support Responses on both routes.
 """
 
 from __future__ import annotations

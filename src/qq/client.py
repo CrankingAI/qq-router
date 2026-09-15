@@ -21,6 +21,7 @@ Two deliberate choices survive from the original Azure-only version:
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -28,7 +29,8 @@ from typing import Any
 
 from .config import Settings
 from .errors import AuthError, ConfigError, NetworkError, QQError
-from .prompt import SYSTEM_INSTRUCTION
+from .prompt import SYSTEM_INSTRUCTION, system_instruction
+from .search import SearchCall, WebSearch
 
 #: API surfaces qq can speak. "auto" resolves to "chat", the only surface the
 #: Azure model router supports and the one every provider implements.
@@ -84,6 +86,10 @@ class Answer:
     upstream: str | None = None
     strategy: str | None = None
     task_type: str | None = None
+    # -v when --search is on: how many searches the model chose to run.
+    # -vv adds the queries themselves, which is the interesting part.
+    search_enabled: bool = False
+    searches: list[SearchCall] = field(default_factory=list)
 
     def _tier1(self) -> str:
         # Provider leads. Once qq can talk to more than one backend, a line that
@@ -96,6 +102,8 @@ class Answer:
         parts.append(f"latency={self.latency:.2f}s")
         if self.input_tokens is not None and self.output_tokens is not None:
             parts.append(f"tokens={self.input_tokens}in/{self.output_tokens}out")
+        if self.search_enabled:
+            parts.append(f"search={len(self.searches)}")
         return "[" + " ".join(parts) + "]"
 
     def _tier2(self) -> str:
@@ -115,6 +123,14 @@ class Answer:
             parts.append(f"cost=${self.cost:.6f}")
         if self.request_id:
             parts.append(f"request={self.request_id}")
+        if self.searches:
+            # What the model actually searched for, which is rarely what the
+            # user typed and is the first thing to look at when an answer is off.
+            parts.append("search_query=" + "|".join(json.dumps(c.query) for c in self.searches))
+            parts.append(f"search_latency={sum(c.latency for c in self.searches):.2f}s")
+            failed = [c.error for c in self.searches if c.error]
+            if failed:
+                parts.append(f"search_error={json.dumps(failed[0])}")
         return "[" + " ".join(parts) + "]"
 
     def _tier3(self) -> list[str]:
@@ -257,7 +273,15 @@ def extract_responses_text(response: Any) -> str:
 
     chunks: list[str] = []
     for item in _attr(response, "output") or []:
+        # Only message items carry the answer. Reasoning items also have text
+        # content, and a tool-call round on OpenRouter returns reasoning with
+        # no message; without this filter that reasoning would be printed as
+        # if it were the answer.
+        if _attr(item, "type") not in (None, "message"):
+            continue
         for block in _attr(item, "content") or []:
+            if _attr(block, "type") not in (None, "output_text"):
+                continue
             block_text = _attr(block, "text")
             if isinstance(block_text, str):
                 chunks.append(block_text)
@@ -371,8 +395,11 @@ def translate_error(exc: Exception, provider: str = "azure") -> QQError:
             )
         elif "unsupported" in detail.lower():
             hint = (
-                "This deployment does not support that API surface. model-router speaks "
-                "Chat Completions only, so drop '--api responses'."
+                "This deployment does not support that API surface here. model-router "
+                "accepts the Responses API only through a Foundry project endpoint "
+                "(https://<account>.services.ai.azure.com/api/projects/<project>); on the "
+                "account endpoint it speaks Chat Completions only. Switch the endpoint, "
+                "or drop '--api responses'."
             )
         return QQError(f"{label} rejected the request (400): {detail}", hint=hint)
     if isinstance(exc, openai.APIStatusError):
@@ -476,13 +503,24 @@ class Backend:
         *,
         stream: bool = False,
         on_delta: Callable[[str], None] | None = None,
+        search: WebSearch | None = None,
     ) -> Answer:
         """Send one prompt and return the answer.
 
         When ``stream`` is true, ``on_delta`` receives text fragments as they
         arrive and the returned ``Answer`` still carries the full text plus the
         routing metadata from the terminal event.
+
+        When ``search`` is given, the model is offered it as a tool and may
+        call it before answering. That needs the Responses API; Chat
+        Completions has a tool protocol of its own that qq does not maintain
+        a second copy of the loop for.
         """
+        if search is not None and self.surface != "responses":
+            raise ConfigError(
+                "web search needs the Responses API",
+                hint="Drop '--api chat', or on Azure point the endpoint at a Foundry project.",
+            )
         client = self._build_client()
         target = self.target
         meta: dict[str, Any] = {}
@@ -491,7 +529,7 @@ class Backend:
         try:
             if self.surface == "responses":
                 text, model, usage = self._via_responses(
-                    client, target, prompt, stream, on_delta, meta
+                    client, target, prompt, stream, on_delta, meta, search
                 )
             else:
                 text, model, usage = self._via_chat(client, target, prompt, stream, on_delta, meta)
@@ -529,6 +567,8 @@ class Backend:
             upstream=meta.get("upstream"),
             strategy=meta.get("strategy"),
             task_type=meta.get("task_type"),
+            search_enabled=search is not None,
+            searches=list(search.calls) if search is not None else [],
         )
 
     # -- Chat Completions ---------------------------------------------------
@@ -592,30 +632,110 @@ class Backend:
         stream: bool,
         on_delta: Callable[[str], None] | None,
         meta: dict[str, Any],
+        search: WebSearch | None = None,
     ) -> tuple[str, str | None, tuple[int | None, int | None]]:
-        if not stream:
-            response = client.responses.create(
-                model=target,
-                instructions=SYSTEM_INSTRUCTION,
-                input=prompt,
-                **self.request_options(),
-            )
-            self.check_inline_error(response)
-            _merge_meta(meta, response, _attr(response, "usage"))
-            self.collect_provider_meta(meta, response, _attr(response, "usage"))
-            return (
-                extract_responses_text(response),
-                _attr(response, "model"),
-                _responses_usage(response),
-            )
+        """One question, possibly several requests.
 
+        Without a search tool this is a single call. With one, the model may
+        reply with a ``function_call`` instead of text; qq runs the search,
+        appends the call and its output to the conversation, and asks again.
+        After ``search.max_rounds`` rounds it sets ``tool_choice`` to ``none``
+        so the model has to answer with what it has found.
+
+        The conversation is resent in full each round rather than chained with
+        ``previous_response_id``. That works on every provider and does not
+        depend on the service storing responses, and the prompts are small.
+        Token counts are summed across rounds, because the user is paying for
+        all of them.
+        """
+        instructions = system_instruction(search is not None)
+        conversation: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
+        chunks: list[str] = []
+        model: str | None = None
+        tokens_in: int | None = None
+        tokens_out: int | None = None
+        rounds = 0
+
+        while True:
+            options: dict[str, Any] = {}
+            if search is not None:
+                options["tools"] = [search.tool]
+                if rounds >= search.max_rounds:
+                    options["tool_choice"] = "none"
+            # A plain question is sent as a plain string, so the request stays
+            # byte-identical to what qq sent before tools existed.
+            input_value: Any = prompt if len(conversation) == 1 else conversation
+
+            if stream:
+                text, final = self._stream_responses(
+                    client, target, instructions, input_value, on_delta, options
+                )
+            else:
+                final = client.responses.create(
+                    model=target,
+                    instructions=instructions,
+                    input=input_value,
+                    **options,
+                    **self.request_options(),
+                )
+                self.check_inline_error(final)
+                text = extract_responses_text(final)
+
+            if text:
+                chunks.append(text)
+            if final is not None:
+                usage = _attr(final, "usage")
+                _merge_meta(meta, final, usage)
+                self.collect_provider_meta(meta, final, usage)
+                model = _attr(final, "model") or model
+                got_in, got_out = _responses_usage(final)
+                tokens_in = _add(tokens_in, got_in)
+                tokens_out = _add(tokens_out, got_out)
+
+            calls = _function_calls(final)
+            if search is None or not calls or options.get("tool_choice") == "none":
+                break
+            for call in calls:
+                call_id = _attr(call, "call_id")
+                arguments = _attr(call, "arguments") or "{}"
+                output = search.run(arguments)
+                conversation.append(
+                    {
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": _attr(call, "name") or search.name,
+                        "arguments": arguments,
+                    }
+                )
+                conversation.append(
+                    {"type": "function_call_output", "call_id": call_id, "output": output}
+                )
+            rounds += 1
+
+        return "".join(chunks).strip(), model, (tokens_in, tokens_out)
+
+    def _stream_responses(
+        self,
+        client: Any,
+        target: str,
+        instructions: str,
+        input_value: Any,
+        on_delta: Callable[[str], None] | None,
+        options: dict[str, Any],
+    ) -> tuple[str, Any]:
+        """Stream one Responses request. Returns the text and the final response.
+
+        A round that ends in a tool call carries no text deltas, so nothing is
+        printed until the model actually answers.
+        """
         chunks: list[str] = []
         final: Any = None
         events = client.responses.create(
             model=target,
-            instructions=SYSTEM_INSTRUCTION,
-            input=prompt,
+            instructions=instructions,
+            input=input_value,
             stream=True,
+            **options,
             **self.request_options(),
         )
         for event in events:
@@ -628,15 +748,28 @@ class Backend:
                         on_delta(piece)
             elif kind in ("response.completed", "response.incomplete", "response.failed"):
                 final = _attr(event, "response")
-
-        text = "".join(chunks).strip()
         if final is not None:
-            _merge_meta(meta, final, _attr(final, "usage"))
+            self.check_inline_error(final)
+        text = "".join(chunks).strip()
         if not text and final is not None:
             text = extract_responses_text(final)
-        model = _attr(final, "model") if final is not None else None
-        usage = _responses_usage(final) if final is not None else (None, None)
-        return text, model, usage
+        return text, final
+
+
+def _function_calls(response: Any) -> list[Any]:
+    """The tool calls a Responses result asks for, in order."""
+    return [
+        item
+        for item in (_attr(response, "output") or [])
+        if (_attr(item, "type") or "") == "function_call"
+    ]
+
+
+def _add(total: int | None, more: int | None) -> int | None:
+    """Sum token counts across rounds, staying None until one is reported."""
+    if more is None:
+        return total
+    return more if total is None else total + more
 
 
 def build_backend(settings: Settings) -> Backend:

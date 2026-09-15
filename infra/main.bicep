@@ -1,9 +1,10 @@
 // qq - Azure infrastructure
 //
 // Subscription-scope deployment: creates the resource group and everything in it.
-// The entire server side of qq is one Azure AI Foundry account plus one
-// model-router deployment. There is deliberately no API, no gateway, no
-// database and no Key Vault: the CLI talks to Foundry directly.
+// The entire server side of qq is one Azure AI Foundry account, one
+// model-router deployment and one Foundry project on the account. There is
+// deliberately no API, no gateway, no database and no Key Vault: the CLI talks
+// to Foundry directly, through the project endpoint.
 //
 //   az deployment sub create \
 //     --location eastus2 \
@@ -30,6 +31,11 @@ param resourceGroupName string = 'rg-${namePrefix}-${environment}'
 
 @description('Name of the model-router deployment. This is the value qq sends as the model id.')
 param routerDeploymentName string = 'qq-router'
+
+@description('''Name of the Foundry project on the account. qq calls the project endpoint,
+because model-router only accepts the Responses API there; the bare account endpoint
+speaks Chat Completions only. Defaults to <namePrefix>-<environment>.''')
+param projectName string = '${namePrefix}-${environment}'
 
 @description('Model-router routing mode. balanced trades cost against quality; cost and quality bias to one end.')
 @allowed([
@@ -117,6 +123,7 @@ module ai 'modules/ai.bicep' = {
     environment: environment
     location: location
     routerDeploymentName: routerDeploymentName
+    projectName: projectName
     routingMode: routingMode
     routerModelVersion: routerModelVersion
     routerCapacity: routerCapacity
@@ -129,7 +136,13 @@ module ai 'modules/ai.bicep' = {
   }
 }
 
-@description('Foundry resource endpoint. Set this as QQ_ENDPOINT.')
+@description('Foundry project endpoint. Set this as QQ_ENDPOINT; qq appends /openai/v1.')
+output projectEndpoint string = ai.outputs.projectEndpoint
+
+@description('Name of the Foundry project.')
+output projectName string = ai.outputs.projectName
+
+@description('Foundry account endpoint. Also works as QQ_ENDPOINT, but the router speaks Chat Completions only there, so --search is unavailable.')
 output endpoint string = ai.outputs.endpoint
 
 @description('Name of the Foundry (Cognitive Services) account.')

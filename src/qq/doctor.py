@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import platform
 import sys
+import time
 from dataclasses import dataclass
 
 from . import __version__
@@ -81,7 +82,8 @@ def _check_endpoint(settings) -> Check:
             "Run ./scripts/configure.sh, or set QQ_ENDPOINT to your Foundry endpoint.",
         )
     source = settings.sources.get("endpoint", "?")
-    return Check(OK, "endpoint", f"{settings.base_url}  [{source}]")
+    kind = "project endpoint" if settings.is_project_endpoint else "account endpoint"
+    return Check(OK, "endpoint", f"{settings.base_url} ({kind})  [{source}]")
 
 
 def _check_deployment(settings) -> Check:
@@ -139,14 +141,53 @@ def _check_auth(settings) -> Check:
 
 def _check_surface(settings) -> Check:
     surface = settings.effective_api
-    if surface == "responses":
+    if (
+        surface == "responses"
+        and settings.effective_provider == "azure"
+        and not settings.is_project_endpoint
+        and not settings.model
+    ):
         return Check(
             WARN,
             "api surface",
-            "responses (only direct model deployments support this)",
-            "model-router speaks Chat Completions only; drop QQ_API=responses for the router.",
+            "responses against model-router on the account endpoint (Azure answers 400)",
+            "Point the endpoint at a Foundry project (./scripts/setup-cli.sh), or drop QQ_API.",
         )
-    return Check(OK, "api surface", "chat completions")
+    return Check(OK, "api surface", surface if surface == "responses" else "chat completions")
+
+
+def _check_search(settings) -> Check:
+    if not settings.search:
+        return Check(OK, "search", "off (use --search, or 'qq config set search true')")
+    if settings.effective_api != "responses":
+        return Check(
+            FAIL,
+            "search",
+            "on, but the API surface is chat completions",
+            "Search needs the Responses API: on Azure use a Foundry project endpoint; "
+            "otherwise drop QQ_API=chat.",
+        )
+    if not settings.brave_api_key:
+        return Check(
+            FAIL,
+            "search",
+            "on, but no Brave Search API key is configured",
+            "Set QQ_BRAVE_API_KEY or BRAVE_API_KEY, or 'qq config set brave_api_key <key>'.",
+        )
+    source = settings.sources.get("brave_api_key", "?")
+    return Check(OK, "search", f"on, Brave key {redact(settings.brave_api_key)}  [{source}]")
+
+
+def _check_search_call(settings) -> Check:
+    from .errors import QQError
+    from .search import brave_search
+
+    started = time.monotonic()
+    try:
+        hits = brave_search("qq doctor", settings.brave_api_key or "", count=1)
+    except QQError as exc:
+        return Check(FAIL, "brave call", exc.message, exc.hint or "")
+    return Check(OK, "brave call", f"{len(hits)} hit(s) in {time.monotonic() - started:.2f}s")
 
 
 def _check_call(settings) -> Check:
@@ -189,6 +230,7 @@ def run_doctor(verbose: bool = False) -> int:
         _check_endpoint(settings),
         _check_deployment(settings),
         _check_surface(settings),
+        _check_search(settings),
     ]
     for check in staged:
         _emit(check)
@@ -207,6 +249,11 @@ def run_doctor(verbose: bool = False) -> int:
     call = _check_call(settings)
     _emit(call)
     checks.append(call)
+
+    if settings.search:
+        search_call = _check_search_call(settings)
+        _emit(search_call)
+        checks.append(search_call)
 
     failures = [c for c in checks if c.status == FAIL]
     warnings = [c for c in checks if c.status == WARN]

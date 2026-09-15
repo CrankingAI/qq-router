@@ -4,9 +4,17 @@ Precedence, highest first:
 
 1. command-line flags
 2. ``QQ_*`` environment variables
-3. ``AZURE_OPENAI_*`` environment variables (so an existing Azure setup works)
-4. the user config file
+3. the user config file
+4. generic environment variables that other tools also read
+   (``AZURE_OPENAI_*``, ``AZURE_TENANT_ID``, ``AZURE_SUBSCRIPTION_ID``,
+   ``OPENROUTER_API_KEY``, ``BRAVE_API_KEY``), so an unconfigured machine
+   works out of the box
 5. built-in defaults
+
+The generic variables sit *below* the config file on purpose. A shell profile
+that exports ``AZURE_OPENAI_ENDPOINT`` for some other tool must not be able to
+redirect a qq that has been configured; ``QQ_ENDPOINT`` or a flag is the
+deliberate way to override.
 
 The config file lives in an OS-appropriate user config directory and is written
 with owner-only permissions. Nothing here ever writes to shell rc files.
@@ -55,11 +63,13 @@ SETTABLE_KEYS = (
     "router",
     "cost_tier",
     "allowed_models",
+    "search",
+    "brave_api_key",
     "timeout",
 )
 
 #: Keys whose values must never be printed.
-SECRET_KEYS = ("api_key", "openrouter_api_key")
+SECRET_KEYS = ("api_key", "openrouter_api_key", "brave_api_key")
 
 AUTH_MODES = ("auto", "entra", "key")
 
@@ -148,7 +158,9 @@ def normalize_endpoint(raw: str) -> str:
     (``*.cognitiveservices.azure.com``, ``*.services.ai.azure.com``,
     ``*.openai.azure.com``) and tolerates a base URL that already carries the
     ``/openai/v1`` suffix, so pasting from the portal or from another tool's
-    config both work.
+    config both work. A Foundry project endpoint
+    (``.../api/projects/<name>``) works the same way: its OpenAI-compatible
+    route hangs off it at ``/openai/v1``.
     """
     value = raw.strip().rstrip("/")
     if not value:
@@ -191,6 +203,11 @@ class Settings:
     cost_tier: str | None = None
     #: Comma-separated patterns restricting what the auto-router may choose.
     allowed_models: str | None = None
+    #: Offer the model a web search tool (Brave). Off by default: most terminal
+    #: questions do not need it, and it sends the model's query to a second
+    #: service.
+    search: bool = False
+    brave_api_key: str | None = None
     api: str = "auto"
     timeout: float = DEFAULT_TIMEOUT
     sources: dict[str, str] = field(default_factory=dict)
@@ -209,6 +226,18 @@ class Settings:
         if self.effective_provider == "openrouter":
             return OPENROUTER_BASE_URL
         return normalize_endpoint(self.endpoint) if self.endpoint else ""
+
+    @property
+    def is_project_endpoint(self) -> bool:
+        """Whether the Azure endpoint is a Foundry *project* endpoint.
+
+        A Foundry account publishes two OpenAI-compatible routes. The account
+        endpoint (``*.openai.azure.com``) only speaks Chat Completions to a
+        ``model-router`` deployment. The project endpoint
+        (``*.services.ai.azure.com/api/projects/<name>``) also accepts the
+        Responses API, which is what tools, and therefore ``--search``, need.
+        """
+        return self.effective_provider == "azure" and "/api/projects/" in self.endpoint
 
     @property
     def allowed_model_list(self) -> list[str]:
@@ -235,10 +264,17 @@ class Settings:
     def effective_api(self) -> str:
         """Resolve ``auto`` into the surface that will actually be used.
 
-        Chat Completions is the default because model-router does not support
-        the Responses API; asking for it against the router returns HTTP 400.
+        Responses is the default wherever it works: on OpenRouter, and on
+        Azure through a Foundry project endpoint. The one place it does not
+        work is a ``model-router`` deployment addressed via the bare account
+        endpoint, which answers ``400 The requested operation is unsupported``,
+        so that case stays on Chat Completions.
         """
-        return "responses" if self.api == "responses" else "chat"
+        if self.api in ("responses", "chat"):
+            return self.api
+        if self.effective_provider == "openrouter" or self.is_project_endpoint:
+            return "responses"
+        return "chat"
 
     def require_endpoint(self) -> str:
         if self.effective_provider == "openrouter":
@@ -252,6 +288,22 @@ class Settings:
                 ),
             )
         return self.base_url
+
+
+_TRUE = ("1", "true", "yes", "on")
+_FALSE = ("0", "false", "no", "off", "")
+
+
+def _truthy(value: object, key: str) -> bool:
+    """Read a boolean that may arrive as a flag, an env var, or a TOML value."""
+    if value is None or isinstance(value, bool):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in _TRUE:
+        return True
+    if text in _FALSE:
+        return False
+    raise ConfigError(f"invalid value for {key}: {value!r}", hint="Use true or false.")
 
 
 def _env(name: str) -> str | None:
@@ -272,6 +324,7 @@ def resolve(
     router: str | None = None,
     provider: str | None = None,
     cost_tier: str | None = None,
+    search: bool | None = None,
     timeout: float | None = None,
 ) -> Settings:
     """Resolve settings from flags, environment, and file values.
@@ -288,10 +341,17 @@ def resolve(
         flag: object,
         env_names: tuple[str, ...],
         file_key: str | None = None,
+        fallback_env: tuple[str, ...] = (),
     ) -> object:
-        """Resolve one setting. ``file_key`` lets a provider keep its own
-        persisted value under a different name, so an Azure endpoint in the
-        config file can never be picked up by an OpenRouter request."""
+        """Resolve one setting.
+
+        ``env_names`` are qq's own variables and outrank the config file.
+        ``fallback_env`` are generic variables other tools also read; they
+        make an unconfigured machine work but never override a config file
+        the user wrote. ``file_key`` lets a provider keep its own persisted
+        value under a different name, so an Azure endpoint in the config file
+        can never be picked up by an OpenRouter request.
+        """
         stored = file_key or key
         if flag not in (None, ""):
             sources[key] = "flag"
@@ -304,6 +364,11 @@ def resolve(
         if values.get(stored) not in (None, ""):
             sources[key] = "config file"
             return values[stored]
+        for name in fallback_env:
+            got = environ.get(name)
+            if got:
+                sources[key] = f"env:{name}"
+                return got
         sources[key] = "default"
         return None
 
@@ -325,27 +390,51 @@ def resolve(
             "deployment", deployment, ("QQ_DEPLOYMENT", "QQ_MODEL"), file_key="openrouter_model"
         )
     else:
-        resolved_endpoint = pick("endpoint", endpoint, ("QQ_ENDPOINT", "AZURE_OPENAI_ENDPOINT"))
+        resolved_endpoint = pick(
+            "endpoint", endpoint, ("QQ_ENDPOINT",), fallback_env=("AZURE_OPENAI_ENDPOINT",)
+        )
         resolved_deployment = pick("deployment", deployment, ("QQ_DEPLOYMENT",))
 
     # Each provider keeps its own key, so both can be configured at once and
     # QQ_PROVIDER=openrouter works without clobbering the Azure setup.
     if is_openrouter:
         resolved_key = pick(
-            "openrouter_api_key", None, ("QQ_OPENROUTER_API_KEY", "OPENROUTER_API_KEY")
+            "openrouter_api_key",
+            None,
+            ("QQ_OPENROUTER_API_KEY",),
+            fallback_env=("OPENROUTER_API_KEY",),
         )
     else:
-        resolved_key = pick("api_key", None, ("QQ_API_KEY", "AZURE_OPENAI_API_KEY"))
+        resolved_key = pick(
+            "api_key", None, ("QQ_API_KEY",), fallback_env=("AZURE_OPENAI_API_KEY",)
+        )
+        # A generic key belongs with the generic endpoint it was exported
+        # alongside. Pairing it with an endpoint from qq's own config would
+        # send some other resource's key here, and with auth=auto it would
+        # also silently switch off Entra. So it counts only when the endpoint
+        # came from the same place.
+        if (
+            sources.get("api_key") == "env:AZURE_OPENAI_API_KEY"
+            and sources.get("endpoint") != "env:AZURE_OPENAI_ENDPOINT"
+        ):
+            resolved_key = None
+            sources["api_key"] = "default"
     resolved_auth = pick("auth", auth, ("QQ_AUTH",))
-    resolved_tenant = pick("tenant", tenant, ("QQ_TENANT_ID", "AZURE_TENANT_ID"))
+    resolved_tenant = pick("tenant", tenant, ("QQ_TENANT_ID",), fallback_env=("AZURE_TENANT_ID",))
     resolved_subscription = pick(
-        "subscription", None, ("QQ_SUBSCRIPTION_ID", "AZURE_SUBSCRIPTION_ID")
+        "subscription", None, ("QQ_SUBSCRIPTION_ID",), fallback_env=("AZURE_SUBSCRIPTION_ID",)
     )
     resolved_model = pick("model", model, ("QQ_MODEL",))
     resolved_api = pick("api", api, ("QQ_API",))
     resolved_router = pick("router", router, ("QQ_ROUTER",))
     resolved_cost_tier = pick("cost_tier", cost_tier, ("QQ_COST_TIER",))
     resolved_allowed = pick("allowed_models", None, ("QQ_ALLOWED_MODELS",))
+    resolved_search = pick("search", search, ("QQ_SEARCH",))
+    # The Brave key is provider-neutral: the same search tool serves both
+    # backends, so it lives under one name and one pair of variables.
+    resolved_brave = pick(
+        "brave_api_key", None, ("QQ_BRAVE_API_KEY",), fallback_env=("BRAVE_API_KEY",)
+    )
     resolved_timeout = pick("timeout", timeout, ("QQ_TIMEOUT",))
 
     auth_mode = str(resolved_auth or "auto").lower()
@@ -374,6 +463,8 @@ def resolve(
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"invalid timeout {resolved_timeout!r}") from exc
 
+    search_value = _truthy(resolved_search, "search")
+
     default_deployment = OPENROUTER_DEFAULT_MODEL if is_openrouter else DEFAULT_DEPLOYMENT
 
     return Settings(
@@ -389,6 +480,8 @@ def resolve(
         router=str(resolved_router) if resolved_router else None,
         cost_tier=tier,
         allowed_models=str(resolved_allowed) if resolved_allowed else None,
+        search=search_value,
+        brave_api_key=str(resolved_brave) if resolved_brave else None,
         timeout=timeout_value,
         sources=sources,
     )

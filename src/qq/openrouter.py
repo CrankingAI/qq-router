@@ -24,6 +24,11 @@ arrive in the body of a successful response; and the real per-request cost is
 reported inline, which is worth surfacing because it is the number a user of a
 paid aggregator actually cares about.
 
+qq speaks the Responses API to OpenRouter by default, the same surface it uses
+on Azure through a project endpoint, so ``--search`` behaves identically on
+both. The auto-router plugin, the metadata header and the inline cost all
+work unchanged there.
+
 Billing note: OpenRouter is billed by OpenRouter, not against Azure credits.
 """
 
@@ -53,7 +58,7 @@ AUTO_ROUTER_PLUGIN_ID = "auto-router"
 
 
 class OpenRouterBackend(Backend):
-    """OpenRouter, speaking Chat Completions."""
+    """OpenRouter, speaking the Responses API by default and Chat Completions on request."""
 
     provider = "openrouter"
     provider_label = "OpenRouter"
@@ -136,7 +141,9 @@ class OpenRouterBackend(Backend):
         if usage is not None:
             cost = _extra(usage, "cost")
             if isinstance(cost, (int, float)):
-                meta["cost"] = float(cost)
+                # Summed, not overwritten: a --search question is several
+                # requests, and the number worth showing is what all of them cost.
+                meta["cost"] = meta.get("cost", 0.0) + float(cost)
 
         metadata = _extra(response, "openrouter_metadata")
         if not isinstance(metadata, dict):

@@ -10,8 +10,12 @@ few days.
 ## What qq does with your credentials
 
 **Nothing leaves your machine except the prompt.** qq makes one HTTPS call, to
-whichever backend you configured: the Azure AI Foundry endpoint, or OpenRouter. There is no telemetry, no
-analytics, no proxy, and no third-party service in the path.
+whichever backend you configured: the Azure AI Foundry endpoint, or OpenRouter.
+There is no telemetry, no analytics, no proxy, and no third-party service in
+the path. The one exception is opt-in: with `--search`, the model may call a
+search tool, and qq then sends the model's search query (derived from your
+prompt, though not your prompt verbatim) to the Brave Search API and hands the
+results back to the model. Search is off unless you turn it on.
 
 **Entra ID is the default and the recommendation.** With `QQ_AUTH=entra`, qq
 holds no secret at all. It asks `DefaultAzureCredential` for a short-lived
@@ -27,8 +31,10 @@ other shell rc file.
 
 **Each backend keeps its own key.** The Azure key and the OpenRouter key are
 stored under separate names and resolved separately, so switching provider never
-sends one service's credential to the other. Both are written with the same
-`0600` permissions and both are masked everywhere.
+sends one service's credential to the other. The Brave Search key, when you
+configure one, is a third named secret with the same handling: it is sent only
+to Brave, as a header, never in a URL. All three are written with the same
+`0600` permissions and all three are masked everywhere.
 
 **Keys are never printed.** `qq config show`, `qq config get api_key`, and
 `qq doctor` all render secrets as a fixed mask that reveals neither the value
@@ -61,10 +67,22 @@ determined prompt injection in piped content can still influence the answer.
 Do not pipe untrusted content and then run the command it suggests without
 reading it.
 
+**Search results are untrusted content, and qq answers are commands.** With
+`--search`, the top results for the model's query come back from the open web
+and are handed to the model as tool output. The system prompt tells the model
+to treat them as evidence rather than instructions, the tool only ever reads,
+and the model can search at most twice per question. But that is the same
+convention as the piped-input block, not a boundary: a page crafted to steer a
+model can steer the answer, and the answer is often a command. Read a searched
+answer before you run it. That is why search is off by default and only runs
+when you ask for it.
+
 ## Infrastructure
 
-The Bicep deploys one Azure AI Foundry account and one model-router deployment.
-It does not output API keys, by design. The account is created with
+The Bicep deploys one Azure AI Foundry account, one model-router deployment,
+and one Foundry project on the account. The project exists so the router can be
+called through the Responses API; it has no keys of its own and inherits the
+account's role assignments. The Bicep does not output API keys, by design. The account is created with
 `disableLocalAuth: false` so that key auth remains available; set
 `disableLocalAuth: true` to refuse keys entirely and require Entra ID.
 

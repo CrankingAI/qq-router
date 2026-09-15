@@ -1,9 +1,12 @@
 """Response extraction, diagnostics, and Azure error translation.
 
-Covers both API surfaces: Chat Completions (what model-router supports, and
-qq's default) and Responses (available on direct model deployments).
+Covers both API surfaces: Chat Completions (model-router on an account
+endpoint) and Responses (project endpoints, OpenRouter, and the search tool
+loop that only Responses supports).
 """
 
+import io
+import json
 import types
 
 import openai
@@ -18,6 +21,7 @@ from qq.client import (
 )
 from qq.config import Settings
 from qq.errors import AuthError, ConfigError, NetworkError, QQError
+from qq.search import TOOL_DEFINITION, WebSearch
 
 
 def settings(**kwargs):
@@ -139,9 +143,16 @@ def test_explicit_model_overrides_the_router_deployment():
     assert FoundryBackend(settings(model="gpt-5.6-sol")).target == "gpt-5.6-sol"
 
 
-def test_default_surface_is_chat_because_the_router_requires_it():
+def test_default_surface_is_chat_on_the_account_endpoint():
+    """model-router rejects Responses there, so auto has to mean chat."""
     assert FoundryBackend(settings()).surface == "chat"
     assert FoundryBackend(settings(api="auto")).surface == "chat"
+
+
+def test_default_surface_is_responses_on_a_project_endpoint():
+    project = "https://x.services.ai.azure.com/api/projects/qq-dev"
+    assert FoundryBackend(settings(endpoint=project)).surface == "responses"
+    assert FoundryBackend(settings(endpoint=project, api="chat")).surface == "chat"
 
 
 def test_responses_surface_is_opt_in():
@@ -493,3 +504,250 @@ def test_backend_collects_azure_vendor_extensions():
     assert answer.router == "model-router:2025-11-18"
     assert answer.tenant == "tenant-1"
     assert answer.api == "chat"
+
+
+# --- the search tool loop ----------------------------------------------------
+
+
+BRAVE_PAYLOAD = {
+    "web": {
+        "results": [
+            {"title": "Python 3.14.7", "url": "https://python.org/r", "description": "Released."}
+        ]
+    }
+}
+
+
+class _Body(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+def brave_opener(payload=BRAVE_PAYLOAD):
+    def opener(request, timeout=None):
+        return _Body(json.dumps(payload).encode())
+
+    return opener
+
+
+def failing_opener(exc):
+    def opener(request, timeout=None):
+        raise exc
+
+    return opener
+
+
+def web(**kwargs):
+    kwargs.setdefault("opener", brave_opener())
+    return WebSearch("brave-key", **kwargs)
+
+
+def function_call(call_id, query):
+    return types.SimpleNamespace(
+        type="function_call",
+        call_id=call_id,
+        name="brave_search",
+        arguments=json.dumps({"query": query}),
+    )
+
+
+def tool_round(*calls, model="gpt-5.6-luna", usage=(10, 5)):
+    """A Responses result that asks for tool calls instead of answering."""
+    return ResponsesResult(model=model, output=list(calls), usage=ResponsesUsage(*usage))
+
+
+def answer_round(text, model="gpt-5.6-luna", usage=(20, 7), extra=()):
+    return ResponsesResult(text=text, model=model, output=list(extra), usage=ResponsesUsage(*usage))
+
+
+class ScriptedResponses:
+    """Answers each create() from a script and records every request."""
+
+    def __init__(self, results):
+        self.results = list(results)
+        self.requests = []
+
+    def create(self, **kwargs):
+        self.requests.append(kwargs)
+        result = self.results.pop(0)
+        return iter(result) if kwargs.get("stream") else result
+
+
+def responses_backend(results, **overrides):
+    overrides.setdefault("endpoint", "https://x.services.ai.azure.com/api/projects/p")
+    backend = FoundryBackend(settings(**overrides))
+    script = ScriptedResponses(results)
+    backend._cached = types.SimpleNamespace(responses=script)
+    return backend, script
+
+
+def test_search_loop_runs_the_tool_and_asks_again():
+    backend, script = responses_backend(
+        [
+            tool_round(function_call("c1", "newest python release")),
+            answer_round("3.14.7\n\nSources: https://python.org/r"),
+        ]
+    )
+    search = web()
+    answer = backend.ask("newest python", search=search)
+
+    assert answer.text == "3.14.7\n\nSources: https://python.org/r"
+    assert [c.query for c in answer.searches] == ["newest python release"]
+    assert answer.searches[0].hits == 1
+    assert answer.search_enabled is True
+    # Tokens are summed across rounds: the user paid for both.
+    assert (answer.input_tokens, answer.output_tokens) == (30, 12)
+
+    first, second = script.requests
+    assert first["tools"] == [TOOL_DEFINITION]
+    assert "tool_choice" not in first
+    assert first["input"] == "newest python"
+    assert "brave_search" in first["instructions"]
+    assert second["input"][0] == {"role": "user", "content": "newest python"}
+    assert second["input"][1]["type"] == "function_call"
+    assert second["input"][1]["call_id"] == "c1"
+    assert second["input"][2]["type"] == "function_call_output"
+    assert second["input"][2]["call_id"] == "c1"
+    assert "[https://python.org/r]" in second["input"][2]["output"]
+
+
+def test_search_loop_forces_an_answer_after_the_round_limit():
+    """A model that keeps refining its query is cut off with tool_choice=none."""
+    backend, script = responses_backend(
+        [
+            tool_round(function_call("c1", "first try")),
+            # Still asking for a search on the forced round; it must be ignored.
+            answer_round("best guess", extra=[function_call("c2", "second try")]),
+        ]
+    )
+    search = web(max_rounds=1)
+    answer = backend.ask("q", search=search)
+
+    assert answer.text == "best guess"
+    assert len(script.requests) == 2
+    assert script.requests[1]["tool_choice"] == "none"
+    assert [c.query for c in search.calls] == ["first try"]
+
+
+def test_search_loop_runs_every_call_in_a_round():
+    backend, script = responses_backend(
+        [
+            tool_round(function_call("c1", "a"), function_call("c2", "b")),
+            answer_round("done"),
+        ]
+    )
+    answer = backend.ask("q", search=web())
+
+    assert [c.query for c in answer.searches] == ["a", "b"]
+    items = script.requests[1]["input"]
+    assert [i.get("type") for i in items[1:]] == [
+        "function_call",
+        "function_call_output",
+        "function_call",
+        "function_call_output",
+    ]
+    assert "search=2" in answer.diagnostics(1)
+
+
+def test_search_loop_streams_only_the_answer():
+    """A tool-call round has no text deltas; nothing prints until the answer."""
+    final_call = tool_round(function_call("c1", "x"))
+    final_answer = answer_round("3.14.7")
+    backend, script = responses_backend(
+        [
+            [types.SimpleNamespace(type="response.completed", response=final_call)],
+            [
+                types.SimpleNamespace(type="response.output_text.delta", delta="3.14"),
+                types.SimpleNamespace(type="response.output_text.delta", delta=".7"),
+                types.SimpleNamespace(type="response.completed", response=final_answer),
+            ],
+        ]
+    )
+    seen = []
+    answer = backend.ask("q", stream=True, on_delta=seen.append, search=web())
+
+    assert seen == ["3.14", ".7"]
+    assert answer.text == "3.14.7"
+    assert len(answer.searches) == 1
+    assert all(r["stream"] is True for r in script.requests)
+
+
+def test_no_tool_is_offered_when_search_is_off():
+    backend, script = responses_backend([answer_round("42")])
+    answer = backend.ask("q")
+
+    assert "tools" not in script.requests[0]
+    assert "brave_search" not in script.requests[0]["instructions"]
+    assert answer.search_enabled is False
+    assert "search=" not in answer.diagnostics(1)
+
+
+def test_search_needs_the_responses_surface():
+    backend = FoundryBackend(settings(api="chat"))
+    with pytest.raises(ConfigError):
+        backend.ask("q", search=web())
+
+
+def test_a_failed_search_still_yields_an_answer():
+    backend, _ = responses_backend(
+        [tool_round(function_call("c1", "x")), answer_round("from memory")]
+    )
+    import urllib.error
+
+    broken = web(opener=failing_opener(urllib.error.URLError("offline")))
+    answer = backend.ask("q", search=broken)
+
+    assert answer.text == "from memory"
+    assert answer.searches[0].error
+    assert "search_error=" in answer.diagnostics(2)
+
+
+def test_search_diagnostics_show_the_query_at_level_two_only():
+    answer = full_answer(search_enabled=True)
+    answer.searches = [types.SimpleNamespace(query="python release date", latency=0.8, error=None)]
+    one, two = answer.diagnostics(2).splitlines()
+    assert one.endswith("search=1]")
+    assert 'search_query="python release date"' in two
+    assert "search_latency=0.80s" in two
+    assert "search_query" not in one
+
+
+def test_responses_extraction_ignores_reasoning_and_tool_items():
+    """Seen live on OpenRouter: a tool-call round returns a reasoning item and
+    no message, and the fallback walk was printing the reasoning as the answer."""
+    reasoning = types.SimpleNamespace(
+        type="reasoning",
+        content=[types.SimpleNamespace(type="reasoning_text", text="Let me think...")],
+    )
+    call = function_call("c1", "x")
+    message = types.SimpleNamespace(
+        type="message",
+        content=[
+            types.SimpleNamespace(type="output_text", text="the answer"),
+            types.SimpleNamespace(type="refusal", text="nope"),
+        ],
+    )
+    assert extract_responses_text(ResponsesResult(output=[reasoning, call])) == ""
+    assert (
+        extract_responses_text(ResponsesResult(output=[reasoning, call, message])) == "the answer"
+    )
+
+
+def test_search_loop_does_not_print_reasoning_from_tool_rounds():
+    reasoning = types.SimpleNamespace(
+        type="reasoning",
+        content=[types.SimpleNamespace(type="reasoning_text", text="Need to search.")],
+    )
+    backend, _ = responses_backend(
+        [
+            ResponsesResult(
+                model="m", output=[reasoning, function_call("c1", "q")], usage=ResponsesUsage(1, 1)
+            ),
+            answer_round("3.14.7"),
+        ]
+    )
+    answer = backend.ask("q", search=web())
+    assert answer.text == "3.14.7"
