@@ -35,9 +35,14 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from . import __version__
 from .errors import AuthError, ConfigError, NetworkError
 
 BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+
+#: Sent to Brave on every search. Identifies the tool and its version, and
+#: carries nothing about the person running it.
+USER_AGENT = f"qq/{__version__} (+https://github.com/CrankingAI/qq-router)"
 
 #: The name the model sees. prompt.py refers to it in the system instruction,
 #: so the two must agree.
@@ -143,7 +148,10 @@ def brave_search(
             "Accept": "application/json",
             "Accept-Encoding": "identity",
             "X-Subscription-Token": api_key,
-            "User-Agent": "qq (+https://github.com/CrankingAI/qq-router)",
+            # Versioned, in the conventional product/version form: qq is a
+            # named client of someone else's API, and an operator looking at
+            # traffic should be able to tell one release from another.
+            "User-Agent": USER_AGENT,
         },
     )
     open_url = opener or urllib.request.urlopen

@@ -9,6 +9,7 @@ import urllib.error
 
 import pytest
 
+from qq import __version__
 from qq.errors import AuthError, ConfigError, NetworkError
 from qq.search import (
     MAX_OUTPUT_CHARS,
@@ -89,6 +90,20 @@ def test_search_sends_the_key_as_a_header_not_in_the_url():
     assert "brave-secret" not in opener.seen["url"]
     assert "q=what+is+a+CNAME" in opener.seen["url"]
     assert "count=5" in opener.seen["url"]
+
+
+def test_search_identifies_itself_and_its_version_to_brave():
+    """qq is a named client of someone else's API, so it says which release.
+
+    product/version is the conventional User-Agent form, and the version is the
+    part that lets an operator tell one release of qq from another.
+    """
+    opener = opener_returning(BRAVE_PAYLOAD)
+    brave_search("what is a CNAME", "k", opener=opener)
+    assert (
+        opener.seen["headers"]["user-agent"]
+        == f"qq/{__version__} (+https://github.com/CrankingAI/qq-router)"
+    )
 
 
 def test_search_returns_cleaned_hits_and_drops_entries_without_a_url():

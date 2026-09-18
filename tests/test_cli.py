@@ -5,10 +5,12 @@ nothing else, so qq composes in a pipeline.
 """
 
 import io
+import pathlib
 
 import pytest
 
 import qq.client as client_module
+from qq import __version__
 from qq.cli import build_parser, detect_subcommand, main, read_stdin
 from qq.client import Answer
 from qq.errors import EXIT_AUTH, EXIT_CONFIG, EXIT_OK, EXIT_USAGE, AuthError
@@ -165,11 +167,34 @@ def test_no_arguments_and_no_stdin_prints_usage_to_stderr(monkeypatch, capsys):
     assert "usage:" in err
 
 
-def test_version_flag(capsys):
+@pytest.mark.parametrize("flag", ["--version", "-V"])
+def test_version_flag(capsys, flag):
     with pytest.raises(SystemExit) as excinfo:
-        build_parser().parse_args(["--version"])
+        build_parser().parse_args([flag])
     assert excinfo.value.code == 0
-    assert "qq" in capsys.readouterr().out
+    # On stdout, and the whole of it: `qq --version` is what a bug report and a
+    # `qq --version | cut -d' ' -f2` both read.
+    assert capsys.readouterr().out.strip() == f"qq {__version__}"
+
+
+def test_the_packaged_version_is_read_from_the_source_line():
+    """pyproject declares the version dynamic and points hatch at this line.
+
+    The wiring is the part that can drift silently: reformat the assignment and
+    the build still succeeds, carrying whatever version hatch last managed to
+    parse. Nothing else in the suite would notice, so this does.
+    """
+    import re
+    import tomllib
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    pyproject = tomllib.loads((root / "pyproject.toml").read_text())
+    assert "version" in pyproject["project"]["dynamic"]
+
+    source = root / pyproject["tool"]["hatch"]["version"]["path"]
+    # hatch's default pattern for a version file.
+    found = re.search(r"""^__version__\s*=\s*['"]([^'"]+)['"]""", source.read_text(), re.MULTILINE)
+    assert found and found.group(1) == __version__
 
 
 def test_streaming_writes_the_answer_to_stdout(monkeypatch, capsys):
@@ -351,3 +376,128 @@ def test_search_diagnostics_never_leak_the_brave_key(monkeypatch, capsys):
         _, out, err = run([flag, "--search", "hi"], monkeypatch, capsys)
         assert BRAVE_SECRET not in out
         assert BRAVE_SECRET not in err
+
+
+# --- how a question gets in -------------------------------------------------
+#
+# The shell reads a command line before qq does, so unquoted English is mangled
+# before argv exists. These cover the two ways in that the shell never touches.
+
+
+class Tty(io.StringIO):
+    def isatty(self):
+        return True
+
+
+def test_a_bare_qq_at_a_terminal_opens_the_prompt(monkeypatch, capsys):
+    """Not usage text: a person who typed `qq` wants to ask something."""
+    monkeypatch.setattr("sys.stdin", Tty(""))
+    code = main([])
+    captured = capsys.readouterr()
+    assert code == EXIT_OK
+    assert "qq> " in captured.err
+    assert captured.out == ""
+
+
+def test_a_bare_qq_without_a_terminal_still_prints_usage(monkeypatch, capsys):
+    """`qq < /dev/null` in a script is a genuine 'I do not know what you want'."""
+    code, out, err = run([], monkeypatch, capsys)
+    assert code == EXIT_USAGE
+    assert out == ""
+    assert "usage:" in err
+
+
+def test_the_prompt_asks_what_is_typed_at_it(monkeypatch, capsys):
+    monkeypatch.setattr("sys.stdin", Tty("what's a CNAME? $HOME (really)\n"))
+    code = main([])
+    assert code == EXIT_OK
+    assert StubBackend.last_prompt == "what's a CNAME? $HOME (really)"
+
+
+def test_interactive_flag_opens_the_prompt(monkeypatch, capsys):
+    monkeypatch.setattr("sys.stdin", Tty(""))
+    code = main(["--interactive"])
+    assert code == EXIT_OK
+    assert "qq> " in capsys.readouterr().err
+
+
+def test_interactive_with_words_asks_them_first(monkeypatch, capsys):
+    monkeypatch.setattr("sys.stdin", Tty(""))
+    code = main(["-i", "what", "is", "a", "CNAME"])
+    assert code == EXIT_OK
+    assert StubBackend.last_prompt == "what is a CNAME"
+
+
+def test_interactive_refuses_piped_input(monkeypatch, capsys):
+    code, out, err = run(["-i"], monkeypatch, capsys, stdin=io.StringIO("piped"))
+    assert code == EXIT_USAGE
+    assert out == ""
+    assert "cannot be combined with piped input" in err
+
+
+def test_interactive_without_a_terminal_is_a_usage_error(monkeypatch, capsys):
+    code, _out, err = run(["-i"], monkeypatch, capsys)
+    assert code == EXIT_USAGE
+    assert "needs a terminal" in err
+
+
+def test_interactive_and_editor_together_are_refused(monkeypatch, capsys):
+    code, _out, err = run(["-i", "-e"], monkeypatch, capsys)
+    assert code == EXIT_USAGE
+    assert "/e opens the editor" in err
+
+
+def test_editor_flag_asks_what_was_composed(monkeypatch, capsys):
+    monkeypatch.setattr("qq.editor.compose", lambda seed="": "what's a CNAME? (really)")
+    code, out, _err = run(["-e"], monkeypatch, capsys)
+    assert code == EXIT_OK
+    assert StubBackend.last_prompt == "what's a CNAME? (really)"
+    assert out.strip().startswith("A CNAME record")
+
+
+def test_editor_flag_combines_with_piped_input(monkeypatch, capsys):
+    monkeypatch.setattr("qq.editor.compose", lambda seed="": "explain this")
+    code, _out, _err = run(["-e"], monkeypatch, capsys, stdin=io.StringIO("a traceback"))
+    assert code == EXIT_OK
+    assert StubBackend.last_prompt.startswith("explain this")
+    assert "a traceback" in StubBackend.last_prompt
+
+
+def test_an_empty_editor_buffer_asks_nothing(monkeypatch, capsys):
+    monkeypatch.setattr("qq.editor.compose", lambda seed="": "")
+    code, out, err = run(["-e"], monkeypatch, capsys)
+    assert code == EXIT_USAGE
+    assert out == ""
+    assert "no question given" in err
+
+
+def test_a_dashed_word_suggests_the_double_dash(monkeypatch, capsys):
+    """argparse's own message is true and useless; the fix is --."""
+    monkeypatch.setattr("sys.stdin", io.StringIO())
+    with pytest.raises(SystemExit) as excinfo:
+        main(["what", "does", "-rf", "do"])
+    err = capsys.readouterr().err
+    assert excinfo.value.code == EXIT_USAGE
+    assert "hint:" in err
+    assert "qq -- <question>" in err
+
+
+def test_the_double_dash_lets_a_dashed_question_through(monkeypatch, capsys):
+    code, _out, _err = run(["--", "what", "does", "-rf", "do"], monkeypatch, capsys)
+    assert code == EXIT_OK
+    assert StubBackend.last_prompt == "what does -rf do"
+
+
+def test_an_ordinary_usage_error_gets_no_double_dash_hint(monkeypatch, capsys):
+    with pytest.raises(SystemExit):
+        main(["--provider", "nonsense"])
+    assert "qq -- <question>" not in capsys.readouterr().err
+
+
+def test_the_help_text_names_every_way_in(capsys):
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["--help"])
+    text = capsys.readouterr().out
+    assert "qq> prompt" in text
+    assert "noglob qq" in text
+    assert "-e" in text and "$EDITOR" in text

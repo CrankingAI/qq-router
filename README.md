@@ -30,6 +30,16 @@ A CNAME record aliases one DNS name to another...
 [provider=azure deployment=qq-router model=gpt-5.6-luna-2026-07-09 latency=1.97s tokens=196in/83out]
 ```
 
+Run `qq` with nothing after it for a prompt where the shell does not get a say,
+so apostrophes, question marks and `$` need no escaping:
+
+```console
+$ qq
+qq> what's the difference between $PATH and ~/bin?
+```
+
+See [Typing a question](#typing-a-question) for why that matters.
+
 Answers go to stdout, diagnostics to stderr, so `qq` composes in a pipeline.
 
 ## Architecture
@@ -239,16 +249,100 @@ az cognitiveservices account keys list -g rg-qq-dev -n <account> --query key1 -o
 ## Usage
 
 ```bash
-qq how do I list all my github repos          # quoting optional
-qq "explain EIP-3009 in two sentences"        # quoting fine too
+qq how do I list all my github repos          # no quoting needed
 qq -v what is a CNAME                         # model and latency on stderr
 qq -vv what is a CNAME                        # plus connection and request context
 qq -vvv what is a CNAME                       # plus server-side timing breakdown
 qq --model gpt-5.6-sol explain TCP slow start # bypass the router
 qq --search what is the newest stable Python release   # let the model look it up
-qq --version
+qq --version                                  # qq 0.2.1; -V is the same
 qq --help
 ```
+
+### Typing a question
+
+The shell reads a command line before `qq` does, and ordinary English is full of
+shell metacharacters. In zsh:
+
+| You type | What actually happens |
+|---|---|
+| `qq what is a CNAME?` | `zsh: no matches found: CNAME?` — qq never runs |
+| `qq what's the difference between A and B` | `zsh: unmatched '` — the shell waits for a closing quote |
+| `qq what does (x, y) mean` | `zsh: unknown file attribute` |
+| `qq what does $PATH mean` | qq is asked about the expansion. **No error** |
+| `qq what is issue #42` | qq is asked `what is issue`. **No error** |
+| `qq is A > B in python` | creates a file called `B` |
+
+The last three are the dangerous ones: a confident answer to a question you did
+not ask. No flag in `qq` can prevent them, because argv arrives already
+mangled. There are four ways around it, in rough order of how often they help.
+
+#### 1. A `qq>` prompt
+
+A bare `qq` at a terminal, or `qq -i`. A line typed here is taken verbatim:
+no quoting, no globbing, no expansion, nothing to escape.
+
+```console
+$ qq
+qq 0.2.1: type a question and press return. Shell quoting does not apply here.
+  Each line is a separate question. Ctrl-D to quit, /help for the rest.
+qq> what's the difference between $PATH and ~/bin?
+`$PATH` is the ordered list of command-search directories; `~/bin` is one
+specific per-user directory that may be included in `$PATH`.
+
+qq>
+```
+
+Each line is a separate question and **nothing is remembered between them**, so
+a follow-up `why?` will not work — ask the whole question again. That is on
+purpose: `qq` is for questions that do not deserve a browser tab, and keeping a
+conversation would change both what the tool is and what it costs. History is
+in memory only and is never written to disk.
+
+At the prompt: `/help`, `/e` to compose in `$EDITOR`, `/exit` or Ctrl-D to
+quit, and a trailing `\` to continue a question on the next line. Ctrl-C
+abandons the line you are typing, not the session.
+
+Answers still go to stdout and everything else to stderr, so `qq > answers.txt`
+with no arguments gives you a prompt on screen and a clean file of answers.
+
+#### 2. `alias qq='noglob qq'` (zsh)
+
+One line in `.zshrc`, and most of the table above stops happening:
+
+| | plain | with `noglob` |
+|---|---|---|
+| `CNAME?`, `a*b`, `c[1]` | ✗ | ✓ |
+| `(x, y)` | ✗ | ✓ |
+| `{x,y}`, `'`, `$HOME`, `#42` | ✗ | ✗ |
+
+It removes the single most common case — a question ending in a question mark —
+and leaves apostrophes, `$` and `#`. For those, use the prompt.
+
+#### 3. `qq -e`
+
+Composes the question in `$EDITOR` (`$VISUAL` and `$QQ_EDITOR` also work;
+`nano` then `vi` if none is set). For anything long or multi-line: a pasted
+stack trace, a paragraph of context, a question with quotes in it. The two
+instruction lines at the top of the buffer are removed and everything else is
+sent exactly as typed — including lines starting with `#`.
+
+```bash
+qq -e                          # empty buffer
+qq -e summarize this design    # opens with those words in it
+git diff | qq -e               # editor for the question, stdin for the input
+```
+
+#### 4. `--`
+
+When a word in the question starts with a dash, `qq` reads it as an option.
+`--` ends the options:
+
+```bash
+qq -- what does -rf do
+```
+
+`qq` suggests this itself when it happens.
 
 ### Piping and stdin
 
@@ -634,6 +728,14 @@ CI runs the tests on Python 3.11 through 3.13, lints and format-checks with
 Ruff, builds and lints the Bicep, ShellChecks the scripts, and scans for
 secrets. **No Azure credentials are used in CI** — the Azure client is stubbed,
 so a fork runs the full suite unchanged.
+
+### Version
+
+`__version__` in `src/qq/__init__.py` is the only place the version is written.
+`pyproject.toml` declares the version dynamic and points hatch at that line, so
+bumping it there is the whole of a version bump — the package metadata follows.
+It is what `qq --version`, `qq doctor` and the `qq>` banner report, and what qq
+sends as its `User-Agent` to Brave when `--search` is on.
 
 ## License
 

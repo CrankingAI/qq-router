@@ -1,8 +1,8 @@
 # TODO / to finish
 
-State as of 2026-09-15. Everything below is either a decision the maintainer
+State as of 2026-09-18. Everything below is either a decision the maintainer
 still has to make, or a known gap. Nothing here blocks daily use: both backends
-work end to end, 211 tests pass, CI is green.
+work end to end, 274 tests pass, CI is green.
 
 ## Decisions to make
 
@@ -57,6 +57,48 @@ plus provisioned resources. OpenRouter has no such constraint:
 
 Recommendation: row one or row two, as an explicit `--search` flag, never on by
 default. Never row three or four for a tool whose pitch is disposable questions.
+
+### 1b. Getting a question past the shell — done, 2026-09-18
+
+Shipped. The problem: ordinary English is full of shell metacharacters, and the
+shell reads a command line before `qq` does, so nothing `qq` parses can undo it.
+Measured against zsh: `qq what is a CNAME?` dies at `no matches found`,
+`qq what's the difference` hangs on an unmatched quote, `qq what does (x, y) mean`
+is a file-attribute error, and — worse, because they are silent — `$PATH`
+expands, `#42` truncates the question at the `#`, and `is A > B` creates a file
+called `B`.
+
+Three of the four options from the analysis are in:
+
+* **A `qq>` prompt** (`src/qq/repl.py`): a bare `qq` at a terminal, or `qq -i`.
+  Deliberately stateless — each line is a fresh question. A conversational REPL
+  would need message history in both backends (`Backend.ask` takes one
+  `prompt: str`) and would turn a disposable-question tool into a chat client
+  with an unpredictable bill. The banner says so out loud, because a prompt
+  otherwise invites a follow-up `why?`. readline history is memory-only: a
+  dotfile of everything someone asked is not something this tool should create
+  behind their back.
+* **`alias qq='noglob qq'`** in the README. Measured coverage: fixes `?`, `*`,
+  `[`, `(`; does not fix `{a,b}`, `'`, `$`, `#`. One line, no code, and it
+  removes the most common case.
+* **`qq -e`** (`src/qq/editor.py`): `$EDITOR` for anything long or multi-line.
+  Falls back to `nano` before `vi`, since someone who never set `$EDITOR` should
+  not need `:wq` to ask a question. Only the two seeded instruction lines are
+  stripped, by exact match, so a question containing `#!/bin/sh` survives.
+* **`--`**, plus a hint that suggests it, because argparse's "unrecognized
+  arguments: -rf do" is true and useless.
+
+Deliberately **not** shipped: a zsh ZLE widget / `accept-line` hook that grabs
+the raw buffer. It is the only thing that would fix apostrophes and `$` on a
+command line, but it is per-shell code to maintain and invisible magic when it
+misfires. Revisit only if the prompt turns out not to absorb the demand.
+
+Also fixed on the way: `tests/conftest.py` now points `QQ_CONFIG_DIR` at an
+empty directory. The suite was reading the developer's real
+`~/.config/qq/config.toml`, so 15 tests failed on any machine where `qq` was
+actually configured (`search = true` in the config reached `resolve()`). CI was
+green because CI has no config file, which is the kind of green that hides a
+bug.
 
 ### 2. Inject today's date into the system prompt
 

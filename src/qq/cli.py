@@ -10,6 +10,10 @@ Design notes:
 * ``config`` and ``doctor`` are recognised as subcommands only when the rest of
   the command line looks like a subcommand invocation. ``qq doctor`` runs the
   diagnostic; ``qq doctor who is the best one`` asks a question.
+* There are three ways in, because the shell mangles unquoted English before qq
+  ever sees it: words on the command line, a ``qq>`` prompt (a bare ``qq`` at a
+  terminal, or ``-i``), and ``$EDITOR`` (``-e``). Only the first is subject to
+  quoting, globbing and expansion.
 """
 
 from __future__ import annotations
@@ -31,12 +35,22 @@ CONFIG_VERBS = ("show", "get", "set", "unset", "path", "list")
 USAGE_EXAMPLES = """\
 examples:
   qq how do I list all my github repos
-  qq "explain EIP-3009 in two sentences"
+  qq explain EIP-3009 in two sentences
   git diff | qq summarize this
   cat error.txt | qq explain this error
   qq --verbose what is a CNAME
-  qq -vvv what is a CNAME          # full server-side timing breakdown
+  qq -vvv what is a CNAME           # full server-side timing breakdown
   qq --search what is the newest stable Python release
+  qq -- what does -rf do            # -- when a word starts with a dash
+
+ways to type a question:
+  qq                                # a qq> prompt: no quoting, no globbing
+  qq -i                             # the same prompt, asked for explicitly
+  qq -e                             # compose it in $EDITOR, for long questions
+
+  The shell reads a command line before qq does, so ? * ( ) ' $ # and friends
+  need quoting there. At the qq> prompt and in the editor they do not. In zsh,
+  `alias qq="noglob qq"` removes most of the need to quote.
 
 subcommands:
   qq config [show|set KEY VALUE|unset KEY|path]
@@ -44,8 +58,35 @@ subcommands:
 """
 
 
+def option_like_hint(message: str) -> str | None:
+    """The one hint argparse cannot give by itself.
+
+    ``qq what does -rf do`` fails with "unrecognized arguments: -rf do", which
+    is true and useless. The fix is ``--``, and a question is far likelier than
+    a typo'd flag.
+    """
+    if "unrecognized arguments" not in message:
+        return None
+    return (
+        "a word in the question starts with '-', so qq read it as an option. "
+        "Put -- first: qq -- <question>. Or type it at the qq> prompt: qq -i."
+    )
+
+
+class _Parser(argparse.ArgumentParser):
+    """argparse, with qq's hint convention on usage errors."""
+
+    def error(self, message: str):
+        self.print_usage(sys.stderr)
+        _err(f"{self.prog}: error: {message}\n")
+        hint = option_like_hint(message)
+        if hint:
+            _err(f"  hint: {hint}\n")
+        raise SystemExit(EXIT_USAGE)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         prog=PROGRAM,
         description="Ask a quick LLM question from your terminal, routed by Azure Model Router.",
         epilog=USAGE_EXAMPLES,
@@ -132,6 +173,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="never search, even if the config file says so",
     )
     parser.add_argument(
+        "-i",
+        "--interactive",
+        action="store_true",
+        help=(
+            "type questions at a qq> prompt, where shell quoting, globbing and "
+            "$expansion do not apply. A bare qq at a terminal does the same"
+        ),
+    )
+    parser.add_argument(
+        "-e",
+        "--editor",
+        action="store_true",
+        help="compose the question in $EDITOR, for long or multi-line questions",
+    )
+    parser.add_argument(
         "--ask",
         action="store_true",
         help="treat the words as a question even if they start with a subcommand name",
@@ -143,8 +199,10 @@ def build_parser() -> argparse.ArgumentParser:
 def read_stdin(stdin: object | None = None) -> str | None:
     """Return piped stdin, or None when stdin is a terminal or unavailable.
 
-    An interactive terminal must never be read here: doing so would make a bare
-    ``qq`` hang waiting for input instead of printing usage.
+    An interactive terminal must never be read here. A bare ``qq`` at a terminal
+    opens the prompt in :mod:`qq.repl`, which reads a line at a time; slurping
+    the terminal to EOF instead would look exactly like ``cat`` with no
+    arguments, which is to say like a hang.
     """
     stream = sys.stdin if stdin is None else stdin
     if stream is None:
@@ -161,6 +219,15 @@ def read_stdin(stdin: object | None = None) -> str | None:
     if not data:
         return None
     return data if isinstance(data, str) else data.decode("utf-8", "replace")
+
+
+def stdin_is_tty(stdin: object | None = None) -> bool:
+    """Whether a human is at the other end of stdin, rather than a pipe."""
+    stream = sys.stdin if stdin is None else stdin
+    try:
+        return bool(stream.isatty())  # type: ignore[attr-defined]
+    except (AttributeError, ValueError):
+        return False
 
 
 def detect_subcommand(words: Sequence[str], forced_ask: bool) -> str | None:
@@ -214,21 +281,15 @@ def _web_search(settings):
     return WebSearch(settings.brave_api_key)
 
 
-def run_query(args: argparse.Namespace, stdin_text: str | None) -> int:
+def _prepare(args: argparse.Namespace):
+    """Resolve settings and build the backend and search tool.
+
+    Split out of :func:`run_query` so the prompt can build them once and reuse
+    them across a whole session: the backend holds no per-question state, and
+    the ``openai`` import behind it costs about a second.
+    """
     from .client import build_backend
     from .config import resolve
-
-    typed = join_args(args.words)
-    piped, truncated = truncate_stdin(stdin_text or "")
-    if truncated and args.verbose:
-        _err("[stdin truncated to the last 100000 characters]\n")
-
-    prompt = build_prompt(typed, piped)
-    if not prompt:
-        raise UsageError(
-            "no question given",
-            hint="Try: qq how do I list all my github repos",
-        )
 
     settings = resolve(
         model=args.model,
@@ -244,9 +305,12 @@ def run_query(args: argparse.Namespace, stdin_text: str | None) -> int:
     )
     backend = build_backend(settings)
     web = _web_search(settings) if settings.search else None
+    return backend, web
 
-    streaming = _should_stream(args.stream)
-    if streaming:
+
+def _answer(prompt: str, args: argparse.Namespace, backend, web) -> None:
+    """Ask one question and write the answer to stdout, diagnostics to stderr."""
+    if _should_stream(args.stream):
         answer = backend.ask(prompt, stream=True, on_delta=_out, search=web)
         if not answer.text.endswith("\n"):
             _out("\n")
@@ -256,7 +320,68 @@ def run_query(args: argparse.Namespace, stdin_text: str | None) -> int:
 
     if args.verbose:
         _err(answer.diagnostics(args.verbose) + "\n")
+
+
+def _typed_and_piped(args: argparse.Namespace, stdin_text: str | None) -> tuple[str, str]:
+    typed = join_args(args.words)
+    piped, truncated = truncate_stdin(stdin_text or "")
+    if truncated and args.verbose:
+        _err("[stdin truncated to the last 100000 characters]\n")
+    return typed, piped
+
+
+def run_query(args: argparse.Namespace, stdin_text: str | None) -> int:
+    typed, piped = _typed_and_piped(args, stdin_text)
+
+    prompt = build_prompt(typed, piped)
+    if not prompt:
+        raise UsageError(
+            "no question given",
+            hint="Try: qq how do I list all my github repos",
+        )
+
+    backend, web = _prepare(args)
+    _answer(prompt, args, backend, web)
     return EXIT_OK
+
+
+def run_editor(args: argparse.Namespace, stdin_text: str | None) -> int:
+    """``qq -e``: compose the question in $EDITOR, then ask it."""
+    from .editor import compose
+
+    seed, piped = _typed_and_piped(args, stdin_text)
+    typed = compose(seed)
+
+    prompt = build_prompt(typed, piped)
+    if not prompt:
+        raise UsageError(
+            "no question given",
+            hint="The editor was closed without a question in it.",
+        )
+
+    backend, web = _prepare(args)
+    _answer(prompt, args, backend, web)
+    return EXIT_OK
+
+
+def run_interactive(args: argparse.Namespace) -> int:
+    """``qq -i``, and a bare ``qq`` at a terminal: the qq> prompt.
+
+    The backend is built on the first question rather than up front, so the
+    prompt appears immediately. A broken configuration still reports itself with
+    the same message and exit code it would have given a one-shot ``qq``.
+    """
+    from .editor import compose
+    from .repl import run_repl
+
+    session: dict[str, object] = {}
+
+    def ask(question: str) -> None:
+        if "backend" not in session:
+            session["backend"], session["web"] = _prepare(args)
+        _answer(question, args, session["backend"], session["web"])
+
+    return run_repl(ask=ask, compose=compose, initial=join_args(args.words))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -275,10 +400,39 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             return run_config(args.words[1:])
 
+        if args.interactive and args.editor:
+            raise UsageError(
+                "use -i or -e, not both",
+                hint="At the qq> prompt, /e opens the editor for one question.",
+            )
+
         stdin_text = read_stdin()
+
+        if args.editor:
+            return run_editor(args, stdin_text)
+
+        if args.interactive:
+            if stdin_text is not None:
+                raise UsageError(
+                    "-i cannot be combined with piped input",
+                    hint="Ask the piped question directly: git diff | qq summarize this",
+                )
+            if not stdin_is_tty():
+                raise UsageError(
+                    "-i needs a terminal to read questions from",
+                    hint="Without one, pass the question as arguments: qq <question>",
+                )
+            return run_interactive(args)
+
         if not args.words and stdin_text is None:
+            # A terminal means a person, and a person who typed a bare `qq`
+            # wants to ask something. Only a non-terminal stdin that produced
+            # nothing is a genuine "I do not know what you want".
+            if stdin_is_tty():
+                return run_interactive(args)
             parser.print_help(sys.stderr)
             return EXIT_USAGE
+
         return run_query(args, stdin_text)
     except QQError as exc:
         _err(f"{PROGRAM}: {exc.message}\n")
