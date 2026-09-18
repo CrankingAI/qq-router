@@ -20,6 +20,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source-path=SCRIPTDIR source=lib/clock.sh
+source "$SCRIPT_DIR/lib/clock.sh"
 
 # Management API version for Cognitive Services; matches infra/modules/ai.bicep.
 CS_API_VERSION="2026-05-01"
@@ -65,7 +67,7 @@ Examples:
   $(basename "$0") --resource-group rg-qq-dev
   $(basename "$0") --endpoint https://qq-dev-abc.openai.azure.com --no-config
 EOF
-  exit 0
+  exit "${1:-0}"
 }
 
 case "${1:-}" in
@@ -86,7 +88,7 @@ while [[ $# -gt 0 ]]; do
     --update-shell)   UPDATE_SHELL=true; shift ;;
     --no-config)      SKIP_CONFIG=true; shift ;;
     --force)          FORCE=true; shift ;;
-    *)                echo "Unknown option: $1" >&2; usage ;;
+    *)                echo "Error: unknown option '$1'" >&2; usage 1 ;;
   esac
 done
 
@@ -332,7 +334,7 @@ if [[ "$SKIP_CONFIG" != true ]]; then
 fi
 
 DURATION=$(( $(date +%s) - START_TIME ))
-echo "🏁 clock stopped (took ${DURATION}s, ended $(date '+%H:%M:%S'))"
+echo "🏁 clock stopped (took $(format_duration "$DURATION"), ended $(date '+%H:%M:%S'))"
 
 echo
 echo "==> Checking the installation..."

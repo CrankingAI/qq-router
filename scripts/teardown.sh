@@ -13,6 +13,10 @@ set -euo pipefail
 # interactive confirmation.
 # ---------------------------------------------------------------------------
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source-path=SCRIPTDIR source=lib/clock.sh
+source "$SCRIPT_DIR/lib/clock.sh"
+
 ENV_NAME="dev"
 NAME_PREFIX="qq"
 RESOURCE_GROUP=""
@@ -41,7 +45,7 @@ Examples:
   $(basename "$0") --env dev
   $(basename "$0") --resource-group rg-qq-dev --yes --purge
 EOF
-  exit 0
+  exit "${1:-0}"
 }
 
 case "${1:-}" in
@@ -57,7 +61,7 @@ while [[ $# -gt 0 ]]; do
     --subscription)   SUBSCRIPTION="${2:?--subscription needs a value}"; shift 2 ;;
     --purge)          PURGE=true; shift ;;
     --yes)            YES=true; shift ;;
-    *)                echo "Unknown option: $1" >&2; usage ;;
+    *)                echo "Error: unknown option '$1'" >&2; usage 1 ;;
   esac
 done
 
@@ -137,7 +141,7 @@ if [[ "$PURGE" == true && -n "$ACCOUNTS" ]]; then
 fi
 
 DURATION=$(( $(date +%s) - START_TIME ))
-echo "🏁 clock stopped (took ${DURATION}s, ended $(date '+%H:%M:%S'))"
+echo "🏁 clock stopped (took $(format_duration "$DURATION"), ended $(date '+%H:%M:%S'))"
 
 cat <<EOF
 

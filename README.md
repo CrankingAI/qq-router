@@ -180,6 +180,23 @@ pass `--update-shell`.
 ./scripts/setup-cli.sh --help
 ```
 
+`uv` and `pipx` copy the source at install time, so the installed `qq` is a
+snapshot: edits here do not reach the command on your PATH until it is
+reinstalled. `sync-cli.sh` does that one thing — no Azure calls, and your
+config file is left alone:
+
+```bash
+./scripts/sync-cli.sh
+./scripts/sync-cli.sh --dry-run
+./scripts/sync-cli.sh --verbose      # show the installer's own output
+./scripts/sync-cli.sh --help
+```
+
+It prints the tree's version and the installed one before it starts, and warns
+if another `qq` — a repo `.venv`, usually — shadows the one it just installed.
+The installer runs quiet, because it relists every dependency on each run even
+when only one package was rebuilt; `--verbose` gives that output back.
+
 Installing by hand instead:
 
 ```bash
@@ -721,7 +738,7 @@ uv run pytest
 uv run ruff check .
 uv run ruff format .
 az bicep build --file infra/main.bicep --stdout > /dev/null
-shellcheck scripts/*.sh
+shellcheck -x scripts/*.sh scripts/lib/*.sh
 ```
 
 CI runs the tests on Python 3.11 through 3.13, lints and format-checks with
@@ -736,6 +753,9 @@ so a fork runs the full suite unchanged.
 bumping it there is the whole of a version bump — the package metadata follows.
 It is what `qq --version`, `qq doctor` and the `qq>` banner report, and what qq
 sends as its `User-Agent` to Brave when `--search` is on.
+
+Bumping it does not move the `qq` already on your PATH — run
+`./scripts/sync-cli.sh` for that.
 
 ## License
 

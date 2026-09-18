@@ -17,6 +17,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source-path=SCRIPTDIR source=lib/clock.sh
+source "$SCRIPT_DIR/lib/clock.sh"
 
 ENV_NAME="dev"
 LOCATION="eastus2"
@@ -57,7 +59,7 @@ Examples:
   $(basename "$0") --env prod --location swedencentral
   $(basename "$0") --dry-run
 EOF
-  exit 0
+  exit "${1:-0}"
 }
 
 case "${1:-}" in
@@ -77,7 +79,7 @@ while [[ $# -gt 0 ]]; do
     --subscription)  SUBSCRIPTION="${2:?--subscription needs a value}"; shift 2 ;;
     --no-grant)      GRANT_SELF=false; shift ;;
     --dry-run)       DRY_RUN=true; shift ;;
-    *)               echo "Unknown option: $1" >&2; usage ;;
+    *)               echo "Error: unknown option '$1'" >&2; usage 1 ;;
   esac
 done
 
@@ -292,7 +294,7 @@ fi
 echo "    $SUBSET_COUNT OpenAI models, no third-party models"
 
 DURATION=$(( $(date +%s) - START_TIME ))
-echo "🏁 clock stopped (took ${DURATION}s, ended $(date '+%H:%M:%S'))"
+echo "🏁 clock stopped (took $(format_duration "$DURATION"), ended $(date '+%H:%M:%S'))"
 
 cat <<EOF
 

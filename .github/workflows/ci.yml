@@ -90,12 +90,12 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Syntax check
-        run: for f in scripts/*.sh; do bash -n "$f"; done
+        run: for f in scripts/*.sh scripts/lib/*.sh; do bash -n "$f"; done
 
       - name: ShellCheck
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-          shellcheck scripts/*.sh
+          shellcheck -x scripts/*.sh scripts/lib/*.sh
 
       - name: Help text is reachable without side effects
         run: for f in scripts/*.sh; do "$f" --help > /dev/null; done
