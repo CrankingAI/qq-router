@@ -13,15 +13,17 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# Runners are pinned rather than ubuntu-latest. That label migrates to Ubuntu 26
-# from 2026-10-19, and an image roll is worth a deliberate commit and its own
-# build rather than a surprise red one on an unrelated push. ubuntu-24.04 is
-# what ubuntu-latest already resolved to, so pinning changed nothing at the
-# time. Bump it on purpose.
+# Pinned, and pinned forward. ubuntu-latest migrates to Ubuntu 26.04 between
+# 2026-10-19 and 2026-11-19 (actions/runner-images#14748); 26.04 is GA, so this
+# repo moved ahead of the roll-out rather than freezing on the image being
+# retired. The migration is therefore a no-op here. The OS surface is small by
+# design - uv fetches its own CPython, Bicep and gitleaks are static binaries,
+# and only shellcheck comes from apt - so bumping this is a one-line change
+# whose build proves itself.
 jobs:
   python:
     name: Lint and test (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
@@ -58,7 +60,7 @@ jobs:
 
   bicep:
     name: Validate Bicep
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v5
 
@@ -83,7 +85,7 @@ jobs:
 
   shell:
     name: Validate shell scripts
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v5
 
@@ -100,7 +102,7 @@ jobs:
 
   secrets:
     name: Secret scan
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v5
         with:
