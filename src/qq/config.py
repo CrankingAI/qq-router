@@ -43,6 +43,21 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 #: OpenRouter's auto-router, the closest equivalent to Azure's model-router.
 OPENROUTER_DEFAULT_MODEL = "openrouter/auto"
 
+#: Rounds of searching the model may do before the tool is taken away.
+#:
+#: Measured on 2026-09-19 against qq-dev, eight questions at a cap of 10:
+#: stable questions searched not at all, most current ones settled in one or
+#: two, and the one that went the distance spent all ten refining a query for
+#: a fact the snippets never stated - 25k input tokens, 135s, and a different
+#: (invented) answer each run. Three leaves room for a second attempt at a bad
+#: first query without paying for that.
+DEFAULT_SEARCH_ROUNDS = 3
+
+#: Ceiling on ``search_rounds``. Not a recommendation: a single ten-round
+#: question was enough to trip the deployment's tokens-per-minute quota on its
+#: own, which then rate limits the next question too.
+MAX_SEARCH_ROUNDS = 10
+
 #: OpenRouter cost tiers. These are percentile bands rather than ceilings, so a
 #: tier excludes models cheaper than the band as well as models above it.
 COST_TIERS = ("low", "medium", "high", "xhigh", "max")
@@ -64,10 +79,23 @@ SETTABLE_KEYS = (
     "cost_tier",
     "allowed_models",
     "search",
+    "search_rounds",
     "brave_api_key",
     "fallback",
     "timeout",
 )
+
+#: Notes written above a key in the config file. The file is regenerated on
+#: every 'qq config set', so a note here survives where a hand-written comment
+#: would not - and the number worth knowing is the one measurement behind the
+#: default, which nothing else in the file could tell you.
+KEY_NOTES = {
+    "search_rounds": (
+        "# Searches the model may run per question (1-10, default 3).",
+        "# Measured: past 3 it mostly re-refines a query it has already",
+        "# answered, and long searches trip the router's rate limit.",
+    ),
+}
 
 #: Keys whose values must never be printed.
 SECRET_KEYS = ("api_key", "openrouter_api_key", "brave_api_key")
@@ -130,6 +158,12 @@ def write_config_file(values: dict[str, object], path: Path | None = None) -> Pa
         value = values[key]
         if value is None or value == "":
             continue
+        notes = KEY_NOTES.get(key, ())
+        if notes:
+            # Blank line first: a note is a heading for the key below it, not a
+            # trailer on the key above it.
+            lines.append("")
+            lines.extend(notes)
         if isinstance(value, bool):
             lines.append(f"{key} = {str(value).lower()}")
         elif isinstance(value, (int, float)):
@@ -213,6 +247,8 @@ class Settings:
     #: questions do not need it, and it sends the model's query to a second
     #: service.
     search: bool = False
+    #: How many rounds of searching one question may pay for.
+    search_rounds: int = DEFAULT_SEARCH_ROUNDS
     brave_api_key: str | None = None
     #: Fall back to the other provider when this one is rate limited. On by
     #: default: it costs nothing until a 429 arrives, and a standby that has to
@@ -328,6 +364,30 @@ def _truthy(value: object, key: str) -> bool:
     raise ConfigError(f"invalid value for {key}: {value!r}", hint="Use true or false.")
 
 
+def _search_rounds(value: object) -> int:
+    """Read the search round cap, which arrives as a flag, env var or TOML value.
+
+    Bounded at both ends. Zero rounds would offer the model a tool it is never
+    allowed to use, and a typo'd 50 would turn one question into a rate limit
+    for the next one.
+    """
+    if value is None or value == "":
+        return DEFAULT_SEARCH_ROUNDS
+    try:
+        rounds = int(str(value).strip())
+    except ValueError:
+        raise ConfigError(
+            f"invalid value for search_rounds: {value!r}",
+            hint=f"Use a whole number from 1 to {MAX_SEARCH_ROUNDS}.",
+        ) from None
+    if not 1 <= rounds <= MAX_SEARCH_ROUNDS:
+        raise ConfigError(
+            f"search_rounds must be between 1 and {MAX_SEARCH_ROUNDS}, not {rounds}",
+            hint=f"{DEFAULT_SEARCH_ROUNDS} is the default; past that it mostly refines queries.",
+        )
+    return rounds
+
+
 def _env(name: str) -> str | None:
     value = os.environ.get(name)
     return value if value else None
@@ -347,6 +407,7 @@ def resolve(
     provider: str | None = None,
     cost_tier: str | None = None,
     search: bool | None = None,
+    search_rounds: int | None = None,
     fallback: bool | None = None,
     timeout: float | None = None,
 ) -> Settings:
@@ -487,6 +548,8 @@ def resolve(
         raise ConfigError(f"invalid timeout {resolved_timeout!r}") from exc
 
     search_value = _truthy(resolved_search, "search")
+    resolved_rounds = pick("search_rounds", search_rounds, ("QQ_SEARCH_ROUNDS",))
+    rounds_value = _search_rounds(resolved_rounds)
     resolved_fallback = pick("fallback", fallback, ("QQ_FALLBACK",))
     fallback_value = True if resolved_fallback is None else _truthy(resolved_fallback, "fallback")
 
@@ -504,6 +567,7 @@ def resolve(
         cost_tier=tier,
         allowed_models=str(resolved_allowed) if resolved_allowed else None,
         search=search_value,
+        search_rounds=rounds_value,
         brave_api_key=str(resolved_brave) if resolved_brave else None,
         fallback=fallback_value,
         timeout=timeout_value,

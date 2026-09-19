@@ -6,6 +6,8 @@ import pytest
 
 from qq.config import (
     DEFAULT_DEPLOYMENT,
+    DEFAULT_SEARCH_ROUNDS,
+    MAX_SEARCH_ROUNDS,
     Settings,
     config_dir,
     normalize_endpoint,
@@ -348,3 +350,31 @@ def test_no_standby_when_the_other_provider_is_not_configured():
     overrides = {"env": {"QQ_ENDPOINT": RESOURCE}}
     settings = resolve(**overrides)
     assert standby(settings, overrides) is None
+
+
+def test_search_rounds_defaults_and_overrides():
+    assert resolve().search_rounds == DEFAULT_SEARCH_ROUNDS == 3
+    # 'qq config set' writes every value as a string, so the file value is one.
+    assert resolve(file_values={"search_rounds": "5"}).search_rounds == 5
+    assert resolve(env={"QQ_SEARCH_ROUNDS": "1"}).search_rounds == 1
+    assert resolve(search_rounds=7).search_rounds == 7
+
+
+@pytest.mark.parametrize("value", [0, -1, MAX_SEARCH_ROUNDS + 1, 50, "lots", "2.5"])
+def test_search_rounds_is_bounded_at_both_ends(value):
+    """Zero offers a tool that may never be used; 50 is a rate limit."""
+    with pytest.raises(ConfigError) as excinfo:
+        resolve(file_values={"search_rounds": value})
+    assert "search_rounds" in excinfo.value.message
+
+
+def test_the_config_file_explains_the_search_round_default(tmp_path):
+    """The one number in the file that needs a reason to go with it."""
+    path = write_config_file({"search_rounds": 4, "deployment": "qq-router"}, tmp_path / "c.toml")
+    text = path.read_text()
+
+    assert "search_rounds = 4" in text
+    # The note is a heading for the key, so it sits above it and below the
+    # unrelated one before it.
+    assert text.index("deployment") < text.index("# Measured") < text.index("search_rounds = 4")
+    assert "default 3" in text

@@ -285,7 +285,7 @@ def _web_search(settings):
         else:
             hint = "Drop '--api chat' (or QQ_API=chat); search needs the Responses API."
         raise ConfigError("--search needs the Responses API", hint=hint)
-    return WebSearch(settings.brave_api_key)
+    return WebSearch(settings.brave_api_key, max_rounds=settings.search_rounds)
 
 
 def _prepare(args: argparse.Namespace):

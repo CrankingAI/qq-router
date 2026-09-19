@@ -191,7 +191,12 @@ def _check_search(settings) -> Check:
             "Set QQ_BRAVE_API_KEY or BRAVE_API_KEY, or 'qq config set brave_api_key <key>'.",
         )
     source = settings.sources.get("brave_api_key", "?")
-    return Check(OK, "search", f"on, Brave key {redact(settings.brave_api_key)}  [{source}]")
+    return Check(
+        OK,
+        "search",
+        f"on, up to {settings.search_rounds} round(s), "
+        f"Brave key {redact(settings.brave_api_key)}  [{source}]",
+    )
 
 
 def _check_search_call(settings) -> Check:

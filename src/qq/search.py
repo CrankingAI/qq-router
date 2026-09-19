@@ -9,10 +9,11 @@ extra; "newest stable Python release" does, and comes back with a source.
 
 Two deliberate limits:
 
-* At most ``MAX_SEARCH_ROUNDS`` rounds of searching per question, after which
-  the tool is taken away and the model answers with what it has. Without this,
-  a model that is not finding what it wants can keep refining its query
-  indefinitely.
+* At most ``settings.search_rounds`` rounds of searching per question, after
+  which the tool is taken away and the model answers with what it has. This is
+  the only thing that stops a model that is not finding what it wants from
+  refining its query indefinitely; see :mod:`qq.prompt` for why asking it
+  nicely is not.
 * Results are trimmed to titles, URLs and snippets, and capped in size. The
   model gets enough to answer and cite, not enough to run up the input bill.
 
@@ -37,6 +38,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import __version__
+from .config import DEFAULT_SEARCH_ROUNDS
 from .errors import AuthError, ConfigError, NetworkError
 
 BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
@@ -52,9 +54,6 @@ TOOL_NAME = "brave_search"
 #: Results per query. Five is enough to answer and cite; more mostly adds
 #: input tokens.
 DEFAULT_COUNT = 5
-
-#: Rounds of searching the model may do before it is told to answer.
-MAX_SEARCH_ROUNDS = 2
 
 #: Ceiling on the text handed back per search, in characters.
 MAX_OUTPUT_CHARS = 6000
@@ -217,7 +216,7 @@ class WebSearch:
         api_key: str | None,
         *,
         count: int = DEFAULT_COUNT,
-        max_rounds: int = MAX_SEARCH_ROUNDS,
+        max_rounds: int = DEFAULT_SEARCH_ROUNDS,
         opener: Any = None,
     ) -> None:
         if not api_key:

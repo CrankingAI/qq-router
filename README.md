@@ -410,8 +410,8 @@ the model decide. A question about a command or a stable concept is answered
 straight away, with no search and no extra cost. A question about a version, a
 date, a price or who currently holds a role makes the model write its own query
 (usually a better one than you typed), read the top five results, and answer
-with a `Sources:` line. It may search at most twice per question; after that it
-has to answer with what it found.
+with a `Sources:` line. It gets three rounds of searching per question; after
+that the tool is withheld and it has to answer with what it found.
 
 ```console
 $ qq --search -vv what is the newest stable Python release
@@ -421,6 +421,36 @@ Sources: https://www.python.org/downloads/release/python-3147/
 [provider=azure deployment=qq-router model=gpt-5.6-terra-2026-07-09 latency=9.21s tokens=1572in/223out search=2]
 [router=model-router:2025-11-18 host=qq-dev-abc.services.ai.azure.com api=responses auth=entra stream=off request=resp_0a2 search_query="site:python.org/downloads/ latest stable Python release"|"site:python.org/downloads/release \"Python 3.14\" release date" search_latency=1.58s]
 ```
+
+#### How many searches
+
+`search_rounds` sets the cap, from 1 to 10, default 3:
+
+```bash
+qq config set search_rounds 4    # or QQ_SEARCH_ROUNDS=4
+```
+
+Three is where measurement put it, not taste. Eight questions were run against
+`model-router` at a cap of 10 on 2026-09-19: stable questions ("capital of
+India", "what is a CNAME") searched **not at all**, most current ones settled
+in **one or two**, and one question — a baseball team's record for a single
+month, which no snippet stated outright — spent **all ten**, 25k input tokens
+and 135 seconds, to produce a different invented number on each run. Three
+leaves room for a second attempt at a bad first query without paying for that.
+
+The ceiling is not a recommendation. One ten-round question was enough to
+exhaust the deployment's tokens-per-minute quota by itself, which then rate
+limits the *next* question too.
+
+**The cap is enforced, not requested.** The system prompt used to also say
+"Search at most twice"; that line is gone. Under it, the model searched ten
+times anyway, and behaved the same when the number in it was changed to ten —
+the sentence was doing no work. What actually stops the loop is `qq` taking the
+tool away for the last round, which needs no cooperation from the model. The
+instruction was also a second place for the number to drift out of sync with
+`search_rounds`. This was one router on one afternoon, so it is worth
+re-measuring per model: a model that *does* respect the instruction would be
+cheaper to stop with a sentence than with a round trip.
 
 It needs two things: a [Brave Search API](https://api-dashboard.search.brave.com/)
 key (`BRAVE_API_KEY`, `QQ_BRAVE_API_KEY`, or `qq config set brave_api_key`), and
@@ -464,6 +494,7 @@ file, generic environment variables (`AZURE_OPENAI_ENDPOINT`,
 | `QQ_COST_TIER` | `cost_tier` | — | `low`, `medium`, `high`, `xhigh`, `max` |
 | `QQ_ALLOWED_MODELS` | `allowed_models` | — | comma-separated patterns the auto-router may pick from |
 | `QQ_SEARCH` | `search` | `false` | offer the model the Brave search tool |
+| `QQ_SEARCH_ROUNDS` | `search_rounds` | `3` | rounds of searching per question, 1-10 ([why 3](#how-many-searches)) |
 | `QQ_FALLBACK` | `fallback` | `true` | answer from the other provider when this one is rate limited |
 | `QQ_BRAVE_API_KEY` | `brave_api_key` | — | Brave Search key; `BRAVE_API_KEY` also works |
 | `QQ_TIMEOUT` | `timeout` | `60` | request timeout in seconds |

@@ -1,6 +1,6 @@
 """Argument joining and stdin combination."""
 
-from qq.prompt import MAX_STDIN_CHARS, build_prompt, join_args, truncate_stdin
+from qq.prompt import MAX_STDIN_CHARS, build_prompt, join_args, system_instruction, truncate_stdin
 
 
 def test_bare_words_join_into_one_prompt():
@@ -62,3 +62,15 @@ def test_search_rules_are_only_added_when_search_is_on():
     assert "brave_search" in with_search
     assert "Sources:" in with_search
     assert "untrusted" in with_search
+
+
+def test_the_search_instruction_claims_no_round_limit():
+    """The cap is enforced, not requested: the model ignored it when asked.
+
+    See the comment in qq/prompt.py. A stated limit was both false and a
+    second place for the number to drift from settings.search_rounds.
+    """
+    text = system_instruction(search=True)
+    assert "brave_search" in text
+    assert "at most twice" not in text
+    assert "at most" not in text.split("brave_search tool")[1]

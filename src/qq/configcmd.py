@@ -106,6 +106,7 @@ def _show() -> int:
             settings.api_key,
         ),
         ("search", "on" if settings.search else "off"),
+        ("search rounds", settings.search_rounds),
         ("brave key", settings.brave_api_key),
         ("standby", _standby_line(settings)),
         ("timeout", settings.timeout),
@@ -121,6 +122,7 @@ def _show() -> int:
             "cost tier": "cost_tier",
             "allowed models": "allowed_models",
             "brave key": "brave_api_key",
+            "search rounds": "search_rounds",
             "standby": "fallback",
         }.get(name, name)
         source = settings.sources.get(key, "")
