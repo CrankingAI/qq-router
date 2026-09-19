@@ -13,7 +13,7 @@ import qq.client as client_module
 from qq import __version__
 from qq.cli import build_parser, detect_subcommand, main, read_stdin
 from qq.client import Answer
-from qq.errors import EXIT_AUTH, EXIT_CONFIG, EXIT_OK, EXIT_USAGE, AuthError
+from qq.errors import EXIT_AUTH, EXIT_CONFIG, EXIT_OK, EXIT_USAGE, AuthError, QQError
 
 SECRET = "azure-api-key-do-not-leak"
 BRAVE_SECRET = "brave-api-key-do-not-leak"
@@ -26,10 +26,12 @@ class StubBackend:
     last_prompt = None
     last_stream = None
     last_search = None
+    last_standby = None
     raises = None
 
-    def __init__(self, settings):
+    def __init__(self, settings, standby=None):
         self.settings = settings
+        StubBackend.last_standby = standby
 
     @property
     def target(self):
@@ -76,6 +78,7 @@ def stub_backend(monkeypatch):
     StubBackend.last_prompt = None
     StubBackend.last_stream = None
     StubBackend.last_search = None
+    StubBackend.last_standby = None
     StubBackend.raises = None
     monkeypatch.setattr(client_module, "build_backend", StubBackend)
     monkeypatch.setenv("QQ_ENDPOINT", "https://x.openai.azure.com")
@@ -145,6 +148,83 @@ def test_error_output_never_contains_the_api_key(monkeypatch, capsys):
     assert SECRET not in err
     assert "rejected" in err
     assert out == ""
+
+
+def test_a_failure_prints_its_diagnostics_under_verbose(monkeypatch, capsys):
+    """The empty-answer hint sends the user to --verbose; it has to pay off."""
+    StubBackend.raises = QQError(
+        "Azure returned an empty answer",
+        hint="Retry, or run with --verbose to see the routing details.",
+        answer=Answer(
+            text="",
+            provider="azure",
+            deployment="qq-router",
+            model="gpt-5.6-luna",
+            api="responses",
+            auth="entra",
+            latency=9.4,
+        ),
+    )
+    code, out, err = run(["-vv", "did", "redsox", "win"], monkeypatch, capsys)
+
+    assert code != EXIT_OK
+    assert out == ""
+    assert "qq: Azure returned an empty answer" in err
+    assert "[provider=azure deployment=qq-router model=gpt-5.6-luna" in err
+    assert "api=responses" in err
+
+
+def test_a_failure_prints_nothing_extra_without_verbose(monkeypatch, capsys):
+    StubBackend.raises = QQError("Azure returned an empty answer", answer=Answer(text=""))
+    _code, _out, err = run(["did", "redsox", "win"], monkeypatch, capsys)
+    assert "[" not in err
+
+
+# --- the OpenRouter standby -------------------------------------------------
+
+
+def test_a_configured_openrouter_key_becomes_the_standby(monkeypatch, capsys):
+    """No flag, no config: a usable second provider is a standby by default."""
+    monkeypatch.setenv("QQ_OPENROUTER_API_KEY", "or-key")
+    run(["what", "is", "a", "CNAME"], monkeypatch, capsys)
+
+    standby = StubBackend.last_standby
+    assert standby is not None
+    assert standby.effective_provider == "openrouter"
+    # Resolved in its own right, not copied: the Azure deployment name and key
+    # would both be wrong here.
+    assert standby.deployment == "openrouter/auto"
+    assert standby.api_key == "or-key"
+
+
+def test_no_openrouter_key_means_no_standby(monkeypatch, capsys):
+    monkeypatch.delenv("QQ_OPENROUTER_API_KEY", raising=False)
+    run(["what", "is", "a", "CNAME"], monkeypatch, capsys)
+    assert StubBackend.last_standby is None
+
+
+@pytest.mark.parametrize("flag", ["--model", "--deployment", "--endpoint"])
+def test_addressing_one_provider_turns_the_standby_off(flag, monkeypatch, capsys):
+    """'Ask this' is a different request from 'answer this'."""
+    monkeypatch.setenv("QQ_OPENROUTER_API_KEY", "or-key")
+    run([flag, "gpt-5.6-sol", "hi"], monkeypatch, capsys)
+    assert StubBackend.last_standby is None
+
+
+def test_the_standby_can_be_switched_off(monkeypatch, capsys):
+    monkeypatch.setenv("QQ_OPENROUTER_API_KEY", "or-key")
+    monkeypatch.setenv("QQ_FALLBACK", "0")
+    run(["hi"], monkeypatch, capsys)
+    assert StubBackend.last_standby is None
+
+
+def test_a_search_question_skips_a_standby_that_cannot_search(monkeypatch, capsys):
+    """--api chat has no tool protocol here, so that standby could only fail."""
+    monkeypatch.setenv("QQ_OPENROUTER_API_KEY", "or-key")
+    monkeypatch.setenv("QQ_BRAVE_API_KEY", BRAVE_SECRET)
+    monkeypatch.setenv("QQ_ENDPOINT", PROJECT_ENDPOINT)
+    run(["--search", "--api", "chat", "hi"], monkeypatch, capsys)
+    assert StubBackend.last_standby is None
 
 
 def test_azure_errors_exit_nonzero_with_a_hint(monkeypatch, capsys):
@@ -501,3 +581,11 @@ def test_the_help_text_names_every_way_in(capsys):
     assert "qq> prompt" in text
     assert "noglob qq" in text
     assert "-e" in text and "$EDITOR" in text
+
+
+def test_the_help_text_ends_with_the_version(capsys):
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["--help"])
+    last = capsys.readouterr().out.rstrip().splitlines()[-1]
+    assert last.startswith(f"qq {__version__}")
+    assert "github.com/CrankingAI/qq-router" in last

@@ -10,8 +10,9 @@ extra; "newest stable Python release" does, and comes back with a source.
 Two deliberate limits:
 
 * At most ``MAX_SEARCH_ROUNDS`` rounds of searching per question, after which
-  the model is told to answer with what it has. Without this, a model that is
-  not finding what it wants can keep refining its query indefinitely.
+  the tool is taken away and the model answers with what it has. Without this,
+  a model that is not finding what it wants can keep refining its query
+  indefinitely.
 * Results are trimmed to titles, URLs and snippets, and capped in size. The
   model gets enough to answer and cite, not enough to run up the input bill.
 

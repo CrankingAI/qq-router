@@ -10,7 +10,7 @@ import io
 import pytest
 
 from qq import __version__
-from qq.errors import EXIT_CONFIG, EXIT_OK, AuthError, ConfigError
+from qq.errors import EXIT_CONFIG, EXIT_OK, AuthError, ConfigError, QQError
 from qq.repl import run_repl
 
 
@@ -155,3 +155,27 @@ def test_an_editor_failure_does_not_end_the_session(monkeypatch, capsys):
     _code, ask = drive(monkeypatch, "/e\nwhat is a CNAME\n", compose=boom)
     assert ask.asked == ["what is a CNAME"]
     assert "editor not found" in capsys.readouterr().err
+
+
+def test_a_failed_question_reports_its_diagnostics_under_verbose(monkeypatch, capsys):
+    """-v means the same thing at the prompt as it does on the command line."""
+
+    class _Answer:
+        def diagnostics(self, level):
+            return "[provider=azure deployment=qq-router]"
+
+    ask = Recorder(raises=QQError("Azure returned an empty answer", answer=_Answer()))
+    drive(monkeypatch, "did redsox win\n", ask=ask, verbose=1)
+    err = capsys.readouterr().err
+    assert "qq: Azure returned an empty answer" in err
+    assert "[provider=azure deployment=qq-router]" in err
+
+
+def test_a_failed_question_stays_quiet_without_verbose(monkeypatch, capsys):
+    class _Answer:
+        def diagnostics(self, level):  # pragma: no cover - must not be called
+            raise AssertionError("diagnostics rendered without --verbose")
+
+    ask = Recorder(raises=QQError("Azure returned an empty answer", answer=_Answer()))
+    drive(monkeypatch, "did redsox win\n", ask=ask)
+    assert "[" not in capsys.readouterr().err

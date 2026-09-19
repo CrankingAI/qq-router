@@ -464,6 +464,7 @@ file, generic environment variables (`AZURE_OPENAI_ENDPOINT`,
 | `QQ_COST_TIER` | `cost_tier` | — | `low`, `medium`, `high`, `xhigh`, `max` |
 | `QQ_ALLOWED_MODELS` | `allowed_models` | — | comma-separated patterns the auto-router may pick from |
 | `QQ_SEARCH` | `search` | `false` | offer the model the Brave search tool |
+| `QQ_FALLBACK` | `fallback` | `true` | answer from the other provider when this one is rate limited |
 | `QQ_BRAVE_API_KEY` | `brave_api_key` | — | Brave Search key; `BRAVE_API_KEY` also works |
 | `QQ_TIMEOUT` | `timeout` | `60` | request timeout in seconds |
 | `QQ_CONFIG_DIR` | — | OS default | override the config directory |
@@ -625,6 +626,38 @@ A CNAME record aliases one DNS name to another...
 OpenRouter reports the real charge for each request, so `cost` at `-vv` is the
 actual money spent, not an estimate. `upstream` and `task` come from an opt-in
 metadata header that `qq` sends for you.
+
+### As a standby
+
+A rate limit is the one failure that says the provider is busy rather than
+that the question was wrong, and by then a second provider is usually already
+configured. So when both are set up, the one you are not using stands by: a
+`429` from Azure is re-asked on OpenRouter (and the other way round) before it
+ever reaches you.
+
+It is silent by design — stdout carries the answer and nothing else — so `-v`
+is where it shows, next to the provider and model that changed with it:
+
+```console
+$ qq -v what is a CNAME
+A CNAME record aliases one DNS name to another...
+[provider=openrouter deployment=openrouter/auto model=deepseek/deepseek-v4-flash latency=3.62s fallback=azure:429]
+```
+
+Three limits keep that quietness honest:
+
+* **Only a rate limit.** A `401`, `404` or `400` is a fact about the
+  configuration; answering it from somewhere else would hide it.
+* **Only before anything is printed.** A streamed answer that breaks off
+  mid-sentence is not replaced, because two models spliced into one answer is
+  worse than an error.
+* **Only for a provider-neutral question.** `--model`, `--deployment` and
+  `--endpoint` all name where to send the question, so they switch the standby
+  off.
+
+If the standby fails too, the rate limit is what gets reported — that is the
+one you can act on — with the standby's failure named in the hint. Set
+`fallback = false` (or `QQ_FALLBACK=0`) to pin every question to one provider.
 
 ### Billing
 

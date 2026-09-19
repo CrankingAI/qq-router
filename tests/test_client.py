@@ -15,12 +15,14 @@ import pytest
 from qq.azure import AzureFoundryBackend as FoundryBackend
 from qq.client import (
     Answer,
+    FailoverBackend,
+    build_backend,
     extract_chat_text,
     extract_responses_text,
     translate_error,
 )
 from qq.config import Settings
-from qq.errors import AuthError, ConfigError, NetworkError, QQError
+from qq.errors import AuthError, ConfigError, NetworkError, QQError, RateLimitedError
 from qq.search import TOOL_DEFINITION, WebSearch
 
 
@@ -193,6 +195,43 @@ def test_azure_errors_map_to_actionable_qq_errors(cls, status, expected):
     translated = translate_error(_status_error(cls, status))
     assert isinstance(translated, expected)
     assert translated.message
+
+
+def _stream_error(message, code=None):
+    """What the SDK raises when an SSE error event interrupts a good response.
+
+    No status code: the request itself returned 200 and failed afterwards.
+    """
+    body = {"message": message}
+    if code is not None:
+        body["code"] = code
+    return openai.APIError(message, request=object(), body=body)
+
+
+def test_a_rate_limit_that_arrives_mid_stream_is_still_a_rate_limit():
+    """qq streams to a terminal, so this is the path a busy router takes.
+
+    The SDK raises a bare APIError for an error event inside the stream, which
+    has no status code to match on; without this the user got "OpenAI client
+    error" and exit 1 for what is a wait-and-retry.
+    """
+    translated = translate_error(
+        _stream_error("Model deployment rate limit exceeded. The system is busy.", code="429")
+    )
+    assert isinstance(translated, NetworkError)
+    assert translated.message == "rate limited by Azure (429)"
+    assert "routerCapacity" in translated.hint
+
+
+def test_a_rate_limit_mid_stream_is_caught_without_a_code():
+    translated = translate_error(_stream_error("Requests to the model have hit a rate limit."))
+    assert isinstance(translated, NetworkError)
+
+
+def test_other_mid_stream_failures_name_the_provider():
+    translated = translate_error(_stream_error("upstream connection reset"))
+    assert isinstance(translated, QQError)
+    assert translated.message == "Azure broke off mid-answer: upstream connection reset"
 
 
 def test_connection_errors_become_network_errors():
@@ -615,7 +654,11 @@ def test_search_loop_runs_the_tool_and_asks_again():
 
 
 def test_search_loop_forces_an_answer_after_the_round_limit():
-    """A model that keeps refining its query is cut off with tool_choice=none."""
+    """A model that keeps refining its query has the tools taken away.
+
+    Withheld, not disabled with ``tool_choice="none"``: the Azure router
+    answers that with another function_call and no text at all.
+    """
     backend, script = responses_backend(
         [
             tool_round(function_call("c1", "first try")),
@@ -628,8 +671,53 @@ def test_search_loop_forces_an_answer_after_the_round_limit():
 
     assert answer.text == "best guess"
     assert len(script.requests) == 2
-    assert script.requests[1]["tool_choice"] == "none"
+    assert "tools" not in script.requests[1]
+    assert "tool_choice" not in script.requests[1]
     assert [c.query for c in search.calls] == ["first try"]
+
+
+def test_an_empty_answer_carries_the_routing_details():
+    """The failure the hint points --verbose at has something to print.
+
+    A model that asks for a search on every round, the forced one included,
+    leaves qq with no text. That is a failure, but not a mystery: the request
+    still knows its deployment, its surface and what it searched for.
+    """
+    backend, script = responses_backend(
+        [
+            tool_round(function_call("c1", "first try")),
+            tool_round(function_call("c2", "second try")),
+        ]
+    )
+    with pytest.raises(QQError) as excinfo:
+        backend.ask("q", search=web(max_rounds=1))
+
+    assert "empty answer" in excinfo.value.message
+    assert len(script.requests) == 2
+    detail = excinfo.value.diagnostics(2)
+    assert "deployment=qq-router" in detail
+    assert "api=responses" in detail
+    assert '"first try"' in detail
+    assert excinfo.value.diagnostics(0) == ""
+
+
+def test_a_transport_failure_carries_the_routing_details():
+    """Same for an error raised by the SDK rather than by an empty body."""
+    backend, _script = responses_backend([])
+    backend._cached = types.SimpleNamespace(
+        responses=types.SimpleNamespace(create=_raise(RuntimeError("boom")))
+    )
+    with pytest.raises(QQError) as excinfo:
+        backend.ask("q")
+
+    assert "deployment=qq-router" in excinfo.value.diagnostics(1)
+
+
+def _raise(exc):
+    def create(**kwargs):
+        raise exc
+
+    return create
 
 
 def test_search_loop_runs_every_call_in_a_round():
@@ -751,3 +839,96 @@ def test_search_loop_does_not_print_reasoning_from_tool_rounds():
     )
     answer = backend.ask("q", search=web())
     assert answer.text == "3.14.7"
+
+
+# --- the standby ------------------------------------------------------------
+
+
+class _Fake:
+    """A backend that answers, or fails in a scripted way."""
+
+    provider_label = "The standby"
+
+    def __init__(self, provider, text=None, raises=None, deltas=()):
+        self.provider = provider
+        self.text = text
+        self.raises = raises
+        self.deltas = deltas
+        self.asked = []
+
+    def ask(self, prompt, *, stream=False, on_delta=None, search=None):
+        self.asked.append(prompt)
+        for piece in self.deltas:
+            if on_delta:
+                on_delta(piece)
+        if self.raises is not None:
+            raise self.raises
+        return Answer(text=self.text, provider=self.provider, model=f"{self.provider}-model")
+
+
+def limited():
+    return RateLimitedError("rate limited by Azure (429)", hint="Wait a moment.")
+
+
+def test_a_rate_limited_primary_is_answered_by_the_standby():
+    primary = _Fake("azure", raises=limited())
+    standby = _Fake("openrouter", text="42")
+    answer = FailoverBackend(primary, standby).ask("q")
+
+    assert answer.text == "42"
+    assert answer.provider == "openrouter"
+    assert standby.asked == ["q"]
+    # Invisible on stdout, so -v is where it has to show.
+    assert "fallback=azure:429" in answer.diagnostics(1)
+    assert "provider=openrouter" in answer.diagnostics(1)
+
+
+def test_only_a_rate_limit_falls_over():
+    """A 401 is a fact about the configuration; hiding it would be worse."""
+    primary = _Fake("azure", raises=AuthError("Azure rejected the credentials (401)"))
+    standby = _Fake("openrouter", text="42")
+    with pytest.raises(AuthError):
+        FailoverBackend(primary, standby).ask("q")
+    assert standby.asked == []
+
+
+def test_no_failover_once_the_answer_has_started_printing():
+    """Two models spliced into one streamed answer would be worse than an error."""
+    printed = []
+    primary = _Fake("azure", raises=limited(), deltas=("half an ",))
+    standby = _Fake("openrouter", text="whole answer")
+    with pytest.raises(RateLimitedError):
+        FailoverBackend(primary, standby).ask("q", stream=True, on_delta=printed.append)
+
+    assert printed == ["half an "]
+    assert standby.asked == []
+
+
+def test_a_standby_that_also_fails_reports_the_original_rate_limit():
+    primary = _Fake("azure", raises=limited())
+    standby = _Fake("openrouter", raises=QQError("insufficient credits (402)"))
+    with pytest.raises(RateLimitedError) as excinfo:
+        FailoverBackend(primary, standby).ask("q")
+
+    assert excinfo.value.message == "rate limited by Azure (429)"
+    assert "insufficient credits (402)" in excinfo.value.hint
+
+
+def test_a_healthy_primary_never_wakes_the_standby():
+    primary = _Fake("azure", text="42")
+    standby = _Fake("openrouter", text="43")
+    answer = FailoverBackend(primary, standby).ask("q")
+
+    assert answer.text == "42"
+    assert standby.asked == []
+    assert answer.fallback_from is None
+    assert "fallback" not in answer.diagnostics(3)
+
+
+def test_build_backend_without_a_standby_returns_the_bare_backend():
+    settings_azure = settings(endpoint="https://x.services.ai.azure.com/api/projects/p")
+    assert isinstance(build_backend(settings_azure), FoundryBackend)
+    paired = build_backend(settings_azure, settings(provider="openrouter", api_key="or-key"))
+    assert isinstance(paired, FailoverBackend)
+    assert paired.provider == "azure"
+    assert paired.standby.provider == "openrouter"

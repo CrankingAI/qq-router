@@ -30,6 +30,18 @@ keys: {", ".join(SETTABLE_KEYS)}
 """
 
 
+def _standby_line(settings) -> str:
+    """Which provider answers a rate limit, in the words 'qq doctor' uses."""
+    from .config import standby
+
+    if not settings.fallback:
+        return "off"
+    other = standby(settings)
+    if other is None:
+        return "none configured"
+    return f"{other.effective_provider} ({other.deployment}) on a 429"
+
+
 def _display(key: str, value: object) -> str:
     if value in (None, ""):
         return "(not set)"
@@ -95,6 +107,7 @@ def _show() -> int:
         ),
         ("search", "on" if settings.search else "off"),
         ("brave key", settings.brave_api_key),
+        ("standby", _standby_line(settings)),
         ("timeout", settings.timeout),
     ]
     width = max(len(name) for name, _ in rows)
@@ -108,6 +121,7 @@ def _show() -> int:
             "cost tier": "cost_tier",
             "allowed models": "allowed_models",
             "brave key": "brave_api_key",
+            "standby": "fallback",
         }.get(name, name)
         source = settings.sources.get(key, "")
         suffix = f"   [{source}]" if source and source != "default" else ""

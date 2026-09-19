@@ -27,7 +27,7 @@ import os
 import stat
 import sys
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .errors import ConfigError
@@ -65,6 +65,7 @@ SETTABLE_KEYS = (
     "allowed_models",
     "search",
     "brave_api_key",
+    "fallback",
     "timeout",
 )
 
@@ -174,6 +175,11 @@ def normalize_endpoint(raw: str) -> str:
     return value + "/openai/v1"
 
 
+def default_deployment(provider: str) -> str:
+    """What a provider addresses when nothing names a deployment or model."""
+    return OPENROUTER_DEFAULT_MODEL if provider == "openrouter" else DEFAULT_DEPLOYMENT
+
+
 def redact(value: str | None) -> str:
     """Render a secret as a fixed mask. Never reveals length or content."""
     if not value:
@@ -208,6 +214,10 @@ class Settings:
     #: service.
     search: bool = False
     brave_api_key: str | None = None
+    #: Fall back to the other provider when this one is rate limited. On by
+    #: default: it costs nothing until a 429 arrives, and a standby that has to
+    #: be switched on before it helps is a standby nobody has switched on.
+    fallback: bool = True
     api: str = "auto"
     timeout: float = DEFAULT_TIMEOUT
     sources: dict[str, str] = field(default_factory=dict)
@@ -238,6 +248,18 @@ class Settings:
         Responses API, which is what tools, and therefore ``--search``, need.
         """
         return self.effective_provider == "azure" and "/api/projects/" in self.endpoint
+
+    @property
+    def is_configured(self) -> bool:
+        """Whether this provider has enough to be worth sending a request to.
+
+        OpenRouter needs a key. Azure needs an endpoint; its credentials can
+        come from ``az login`` rather than the config file, so the key is not
+        the test.
+        """
+        if self.effective_provider == "openrouter":
+            return bool(self.api_key)
+        return bool(self.endpoint)
 
     @property
     def allowed_model_list(self) -> list[str]:
@@ -325,6 +347,7 @@ def resolve(
     provider: str | None = None,
     cost_tier: str | None = None,
     search: bool | None = None,
+    fallback: bool | None = None,
     timeout: float | None = None,
 ) -> Settings:
     """Resolve settings from flags, environment, and file values.
@@ -464,13 +487,13 @@ def resolve(
         raise ConfigError(f"invalid timeout {resolved_timeout!r}") from exc
 
     search_value = _truthy(resolved_search, "search")
-
-    default_deployment = OPENROUTER_DEFAULT_MODEL if is_openrouter else DEFAULT_DEPLOYMENT
+    resolved_fallback = pick("fallback", fallback, ("QQ_FALLBACK",))
+    fallback_value = True if resolved_fallback is None else _truthy(resolved_fallback, "fallback")
 
     return Settings(
         provider=provider_name,
         endpoint=str(resolved_endpoint or ""),
-        deployment=str(resolved_deployment or default_deployment),
+        deployment=str(resolved_deployment or default_deployment(provider_name)),
         api_key=str(resolved_key) if resolved_key else None,
         auth=auth_mode,
         tenant=str(resolved_tenant) if resolved_tenant else None,
@@ -482,6 +505,46 @@ def resolve(
         allowed_models=str(resolved_allowed) if resolved_allowed else None,
         search=search_value,
         brave_api_key=str(resolved_brave) if resolved_brave else None,
+        fallback=fallback_value,
         timeout=timeout_value,
         sources=sources,
     )
+
+
+def standby(settings: Settings, overrides: dict[str, object] | None = None) -> Settings | None:
+    """The other provider's settings, when it can stand in for this one.
+
+    Resolved by a second full pass rather than by copying the primary's
+    settings: each provider keeps its own key, its own default model and its
+    own endpoint rules, and a copy would point an OpenRouter request at an
+    Azure deployment name.
+
+    Returns None when there is nothing to stand by with, or when standing by
+    would answer a different question from the one asked. ``overrides`` is the
+    same mapping that produced ``settings``, so a flag that names one provider
+    is visible here.
+    """
+    overrides = dict(overrides or {})
+    if not settings.fallback:
+        return None
+    # A question that names where to send it - an explicit model, deployment
+    # or endpoint - is not a question another provider can answer.
+    if settings.model or overrides.get("deployment") or overrides.get("endpoint"):
+        return None
+    other = "openrouter" if settings.effective_provider == "azure" else "azure"
+    for key in ("model", "deployment", "endpoint", "provider"):
+        overrides.pop(key, None)
+    candidate = resolve(provider=other, **overrides)  # type: ignore[arg-type]
+    if not candidate.is_configured:
+        return None
+    # QQ_DEPLOYMENT and QQ_MODEL name no provider, so a value exported for the
+    # primary arrives here as the standby's model slug: 'qq-router' is an Azure
+    # deployment, not something OpenRouter can serve. Anything that did not
+    # come from the standby's own configuration goes back to its default.
+    if candidate.sources.get("deployment", "").startswith("env:"):
+        candidate = replace(candidate, deployment=default_deployment(other))
+    # A search question needs the Responses API, and a standby that cannot run
+    # the tool would fail the moment it was asked.
+    if settings.search and candidate.effective_api != "responses":
+        return None
+    return candidate

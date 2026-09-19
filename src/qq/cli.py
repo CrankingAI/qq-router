@@ -57,6 +57,13 @@ subcommands:
   qq doctor
 """
 
+#: The last line of --help, where the version is both out of the way and still
+#: on screen once the options have scrolled past. It answers "which qq is this,
+#: and where does it live?" in one line - useful when several are installed, a
+#: uv tool and a venv on PATH both answering to ``qq``. ``qq --version`` stays
+#: the terse machine-readable form.
+FOOTER = f"\n{PROGRAM} {__version__} - https://github.com/CrankingAI/qq-router\n"
+
 
 def option_like_hint(message: str) -> str | None:
     """The one hint argparse cannot give by itself.
@@ -89,7 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = _Parser(
         prog=PROGRAM,
         description="Ask a quick LLM question from your terminal, routed by Azure Model Router.",
-        epilog=USAGE_EXAMPLES,
+        epilog=USAGE_EXAMPLES + FOOTER,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         add_help=True,
     )
@@ -289,21 +296,24 @@ def _prepare(args: argparse.Namespace):
     the ``openai`` import behind it costs about a second.
     """
     from .client import build_backend
-    from .config import resolve
+    from .config import resolve, standby
 
-    settings = resolve(
-        model=args.model,
-        deployment=args.deployment,
-        endpoint=args.endpoint,
-        auth=args.auth,
-        tenant=args.tenant,
-        api=args.api,
-        provider=args.provider,
-        cost_tier=args.cost_tier,
-        search=args.search,
-        timeout=args.timeout,
-    )
-    backend = build_backend(settings)
+    # One mapping, used twice: the standby has to be resolved from the same
+    # overrides, and has to be able to see which of them name a provider.
+    overrides: dict[str, object] = {
+        "model": args.model,
+        "deployment": args.deployment,
+        "endpoint": args.endpoint,
+        "auth": args.auth,
+        "tenant": args.tenant,
+        "api": args.api,
+        "provider": args.provider,
+        "cost_tier": args.cost_tier,
+        "search": args.search,
+        "timeout": args.timeout,
+    }
+    settings = resolve(**overrides)  # type: ignore[arg-type]
+    backend = build_backend(settings, standby(settings, overrides))
     web = _web_search(settings) if settings.search else None
     return backend, web
 
@@ -381,7 +391,7 @@ def run_interactive(args: argparse.Namespace) -> int:
             session["backend"], session["web"] = _prepare(args)
         _answer(question, args, session["backend"], session["web"])
 
-    return run_repl(ask=ask, compose=compose, initial=join_args(args.words))
+    return run_repl(ask=ask, compose=compose, initial=join_args(args.words), verbose=args.verbose)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -438,6 +448,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         _err(f"{PROGRAM}: {exc.message}\n")
         if exc.hint:
             _err(f"  hint: {exc.hint}\n")
+        # A failure is exactly when the routing details are worth having, and
+        # the hint on an empty answer sends the user here.
+        detail = exc.diagnostics(args.verbose)
+        if detail:
+            _err(detail + "\n")
         return exc.exit_code
     except KeyboardInterrupt:
         _err("\n")

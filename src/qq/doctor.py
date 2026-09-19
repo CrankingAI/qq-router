@@ -71,6 +71,22 @@ def _check_provider(settings) -> Check:
     return Check(OK, "provider", f"{settings.effective_provider} ({label})  [{source}]")
 
 
+def _check_standby(settings) -> Check:
+    """Whether a rate limit gets re-asked elsewhere, and where.
+
+    Worth a line of its own: a failover is silent by design, so this is where
+    you find out that a busy Azure will quietly bill OpenRouter instead.
+    """
+    from .config import standby
+
+    if not settings.fallback:
+        return Check(OK, "standby", "off  [fallback = false]")
+    other = standby(settings)
+    if other is None:
+        return Check(OK, "standby", "none configured; a 429 is reported, not retried")
+    return Check(OK, "standby", f"{other.effective_provider} ({other.deployment}) on a 429")
+
+
 def _check_endpoint(settings) -> Check:
     if settings.effective_provider == "openrouter":
         return Check(OK, "endpoint", settings.base_url)
@@ -231,6 +247,7 @@ def run_doctor(verbose: bool = False) -> int:
         _check_deployment(settings),
         _check_surface(settings),
         _check_search(settings),
+        _check_standby(settings),
     ]
     for check in staged:
         _emit(check)

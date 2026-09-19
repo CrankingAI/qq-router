@@ -96,12 +96,15 @@ def run_repl(
     ask: Callable[[str], None],
     compose: Callable[[str], str] | None = None,
     initial: str | None = None,
+    verbose: int = 0,
 ) -> int:
     """Drive the prompt until EOF.
 
     ``ask`` answers one question and raises QQError on failure. ``compose``
     opens an editor and returns the text, for ``/e``. ``initial`` is answered
     before the first prompt, which is what ``qq -i <question>`` does.
+    ``verbose`` is the -v count, used only to report failures at the same
+    detail a successful answer gets.
     """
     _enable_line_editing()
     _err(BANNER)
@@ -147,7 +150,7 @@ def run_repl(
                     try:
                         question = compose("")
                     except QQError as exc:
-                        _report(exc)
+                        _report(exc, verbose)
                         continue
                     if not question:
                         continue
@@ -161,14 +164,17 @@ def run_repl(
         except ConfigError as exc:
             # Configuration will not fix itself between prompts, so stop rather
             # than fail identically on every question from here on.
-            _report(exc)
+            _report(exc, verbose)
             return exc.exit_code
         except QQError as exc:
-            _report(exc)
+            _report(exc, verbose)
         _err("\n")
 
 
-def _report(exc: QQError) -> None:
+def _report(exc: QQError, verbose: int = 0) -> None:
     _err(f"qq: {exc.message}\n")
     if exc.hint:
         _err(f"  hint: {exc.hint}\n")
+    detail = exc.diagnostics(verbose)
+    if detail:
+        _err(detail + "\n")

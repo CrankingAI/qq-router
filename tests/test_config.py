@@ -12,6 +12,7 @@ from qq.config import (
     read_config_file,
     redact,
     resolve,
+    standby,
     write_config_file,
 )
 from qq.errors import ConfigError
@@ -326,3 +327,24 @@ def test_a_generic_azure_key_is_only_used_with_the_generic_endpoint():
     )
     assert paired.api_key == "paired-key"
     assert paired.effective_auth == "key"
+
+
+def test_the_standby_works_in_both_directions():
+    """OpenRouter is the usual standby, but a rate limit can go either way."""
+    overrides = {
+        "provider": "openrouter",
+        "env": {"QQ_OPENROUTER_API_KEY": "or-key", "QQ_ENDPOINT": RESOURCE},
+    }
+    settings = resolve(**overrides)
+    other = standby(settings, overrides)
+
+    assert settings.effective_provider == "openrouter"
+    assert other.effective_provider == "azure"
+    assert other.endpoint == RESOURCE
+    assert other.deployment == DEFAULT_DEPLOYMENT
+
+
+def test_no_standby_when_the_other_provider_is_not_configured():
+    overrides = {"env": {"QQ_ENDPOINT": RESOURCE}}
+    settings = resolve(**overrides)
+    assert standby(settings, overrides) is None

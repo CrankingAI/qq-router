@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .config import Settings
-from .errors import AuthError, ConfigError, NetworkError, QQError
+from .errors import AuthError, ConfigError, NetworkError, QQError, RateLimitedError
 from .prompt import SYSTEM_INSTRUCTION, system_instruction
 from .search import SearchCall, WebSearch
 
@@ -90,6 +90,11 @@ class Answer:
     # -vv adds the queries themselves, which is the interesting part.
     search_enabled: bool = False
     searches: list[SearchCall] = field(default_factory=list)
+    #: Set when the standby answered, to the provider that could not and why,
+    #: e.g. "azure:429". A failover is silent on stdout, so -v is the only
+    #: place it shows: without this the model and provider would change for no
+    #: visible reason.
+    fallback_from: str | None = None
 
     def _tier1(self) -> str:
         # Provider leads. Once qq can talk to more than one backend, a line that
@@ -104,6 +109,8 @@ class Answer:
             parts.append(f"tokens={self.input_tokens}in/{self.output_tokens}out")
         if self.search_enabled:
             parts.append(f"search={len(self.searches)}")
+        if self.fallback_from:
+            parts.append(f"fallback={self.fallback_from}")
         return "[" + " ".join(parts) + "]"
 
     def _tier2(self) -> str:
@@ -344,6 +351,10 @@ _NOT_FOUND_HINTS = {
 }
 
 
+#: Both paths a rate limit can arrive by say the same thing about fixing it.
+_RATE_LIMIT_HINT = "Wait a moment, or raise routerCapacity and redeploy the Bicep."
+
+
 def translate_error(exc: Exception, provider: str = "azure") -> QQError:
     """Map an SDK exception onto a qq error with an actionable hint."""
     import openai
@@ -371,10 +382,7 @@ def translate_error(exc: Exception, provider: str = "azure") -> QQError:
             hint="Top up at https://openrouter.ai/settings/credits.",
         )
     if isinstance(exc, openai.RateLimitError):
-        return NetworkError(
-            f"rate limited by {label} (429)",
-            hint="Wait a moment, or raise routerCapacity and redeploy the Bicep.",
-        )
+        return RateLimitedError(f"rate limited by {label} (429)", hint=_RATE_LIMIT_HINT)
     if isinstance(exc, openai.APITimeoutError):
         return NetworkError(
             f"the request to {label} timed out",
@@ -404,6 +412,15 @@ def translate_error(exc: Exception, provider: str = "azure") -> QQError:
         return QQError(f"{label} rejected the request (400): {detail}", hint=hint)
     if isinstance(exc, openai.APIStatusError):
         return QQError(f"{label} returned HTTP {exc.status_code}: {_short(exc)}")
+    if isinstance(exc, openai.APIError):
+        # A streamed request that fails after the response opens arrives as an
+        # SSE error event, which the SDK raises as a bare APIError: no status
+        # code, so every branch above misses it and a plain 429 used to reach
+        # the user as "OpenAI client error". The body still carries the code.
+        detail = exc.message or str(exc)
+        if str(exc.code or "") == "429" or "rate limit" in detail.lower():
+            return RateLimitedError(f"rate limited by {label} (429)", hint=_RATE_LIMIT_HINT)
+        return QQError(f"{label} broke off mid-answer: {detail}", hint="Retry.")
     if isinstance(exc, openai.OpenAIError):
         return QQError(f"OpenAI client error: {exc}")
     return QQError(str(exc))
@@ -526,6 +543,45 @@ class Backend:
         meta: dict[str, Any] = {}
         started = time.monotonic()
 
+        def snapshot(
+            text: str = "",
+            model: str | None = None,
+            usage: tuple[int | None, int | None] = (None, None),
+        ) -> Answer:
+            """Everything qq knows about this request, answered or not.
+
+            A failure gets one too, and it is what --verbose prints when the
+            question did not survive: which endpoint and surface were used,
+            and what the model searched for before it gave up.
+            """
+            return Answer(
+                text=text,
+                model=model,
+                deployment=target,
+                latency=time.monotonic() - started,
+                input_tokens=usage[0],
+                output_tokens=usage[1],
+                provider=self.provider,
+                router=self.router_label,
+                cost=meta.get("cost"),
+                host=self.host,
+                api=self.surface,
+                auth=self.settings.effective_auth,
+                stream=stream,
+                request_id=meta.get("request_id"),
+                server_timings=meta.get("server_timings", {}),
+                replica=meta.get("replica"),
+                cached_tokens=meta.get("cached_tokens"),
+                reasoning_tokens=meta.get("reasoning_tokens"),
+                token_cache=self._auth_stats.get("token_cache"),
+                tenant=self.tenant_label,
+                upstream=meta.get("upstream"),
+                strategy=meta.get("strategy"),
+                task_type=meta.get("task_type"),
+                search_enabled=search is not None,
+                searches=list(search.calls) if search is not None else [],
+            )
+
         try:
             if self.surface == "responses":
                 text, model, usage = self._via_responses(
@@ -533,43 +589,22 @@ class Backend:
                 )
             else:
                 text, model, usage = self._via_chat(client, target, prompt, stream, on_delta, meta)
-        except QQError:
+        except QQError as exc:
+            if exc.answer is None:
+                exc.answer = snapshot()
             raise
         except Exception as exc:
-            raise translate_error(exc, self.provider) from exc
+            error = translate_error(exc, self.provider)
+            error.answer = snapshot()
+            raise error from exc
 
         if not text:
             raise QQError(
                 f"{self.provider_label} returned an empty answer",
                 hint="Retry, or run with --verbose to see the routing details.",
+                answer=snapshot(text, model, usage),
             )
-        return Answer(
-            text=text,
-            model=model,
-            deployment=target,
-            latency=time.monotonic() - started,
-            input_tokens=usage[0],
-            output_tokens=usage[1],
-            provider=self.provider,
-            router=self.router_label,
-            cost=meta.get("cost"),
-            host=self.host,
-            api=self.surface,
-            auth=self.settings.effective_auth,
-            stream=stream,
-            request_id=meta.get("request_id"),
-            server_timings=meta.get("server_timings", {}),
-            replica=meta.get("replica"),
-            cached_tokens=meta.get("cached_tokens"),
-            reasoning_tokens=meta.get("reasoning_tokens"),
-            token_cache=self._auth_stats.get("token_cache"),
-            tenant=self.tenant_label,
-            upstream=meta.get("upstream"),
-            strategy=meta.get("strategy"),
-            task_type=meta.get("task_type"),
-            search_enabled=search is not None,
-            searches=list(search.calls) if search is not None else [],
-        )
+        return snapshot(text, model, usage)
 
     # -- Chat Completions ---------------------------------------------------
 
@@ -639,8 +674,8 @@ class Backend:
         Without a search tool this is a single call. With one, the model may
         reply with a ``function_call`` instead of text; qq runs the search,
         appends the call and its output to the conversation, and asks again.
-        After ``search.max_rounds`` rounds it sets ``tool_choice`` to ``none``
-        so the model has to answer with what it has found.
+        After ``search.max_rounds`` rounds the tools are withheld, so the model
+        has to answer with what it has found.
 
         The conversation is resent in full each round rather than chained with
         ``previous_response_id``. That works on every provider and does not
@@ -658,10 +693,15 @@ class Backend:
 
         while True:
             options: dict[str, Any] = {}
-            if search is not None:
+            # The round that ends the search withholds the tools rather than
+            # sending them with ``tool_choice="none"``. tool_choice is
+            # advisory: Azure's model router asks for another search anyway,
+            # and a round that only calls a tool carries no text, so the whole
+            # question dies as "returned an empty answer". A model with no
+            # tools in front of it answers from what it already found.
+            capped = search is not None and rounds >= search.max_rounds
+            if search is not None and not capped:
                 options["tools"] = [search.tool]
-                if rounds >= search.max_rounds:
-                    options["tool_choice"] = "none"
             # A plain question is sent as a plain string, so the request stays
             # byte-identical to what qq sent before tools existed.
             input_value: Any = prompt if len(conversation) == 1 else conversation
@@ -693,7 +733,7 @@ class Backend:
                 tokens_out = _add(tokens_out, got_out)
 
             calls = _function_calls(final)
-            if search is None or not calls or options.get("tool_choice") == "none":
+            if search is None or not calls or capped:
                 break
             for call in calls:
                 call_id = _attr(call, "call_id")
@@ -772,14 +812,92 @@ def _add(total: int | None, more: int | None) -> int | None:
     return more if total is None else total + more
 
 
-def build_backend(settings: Settings) -> Backend:
-    """Pick a backend from the resolved settings.
+class FailoverBackend:
+    """A primary backend with a standby, for the one failure that is temporary.
+
+    A rate limit says the provider is busy, not that the question was wrong,
+    and qq has a second provider already configured. Asking it is invisible by
+    design: stdout carries the answer and nothing else, so the only trace is
+    ``fallback=`` on the -v line, next to the provider and model that changed
+    with it.
+
+    Two rules keep that invisibility honest:
+
+    * Only a rate limit fails over. A 401, a 404 or a 400 is a fact about the
+      configuration, and quietly answering from somewhere else would hide it.
+    * Never once text has reached stdout. A streamed answer that broke off
+      mid-sentence cannot be replaced by a second model's attempt without
+      splicing two voices into one answer; that failure stays a failure.
+
+    The standby is only ever asked one question, so a busy primary costs one
+    extra round trip rather than a retry storm.
+    """
+
+    def __init__(self, primary: Backend, standby: Backend) -> None:
+        self.primary = primary
+        self.standby = standby
+
+    @property
+    def provider(self) -> str:
+        return self.primary.provider
+
+    @property
+    def target(self) -> str:
+        return self.primary.target
+
+    @property
+    def surface(self) -> str:
+        return self.primary.surface
+
+    def ask(
+        self,
+        prompt: str,
+        *,
+        stream: bool = False,
+        on_delta: Callable[[str], None] | None = None,
+        search: WebSearch | None = None,
+    ) -> Answer:
+        emitted = False
+
+        def watch(piece: str) -> None:
+            nonlocal emitted
+            emitted = True
+            if on_delta is not None:
+                on_delta(piece)
+
+        try:
+            return self.primary.ask(prompt, stream=stream, on_delta=watch, search=search)
+        except RateLimitedError as exc:
+            if emitted:
+                raise
+            limited = exc
+
+        try:
+            answer = self.standby.ask(prompt, stream=stream, on_delta=on_delta, search=search)
+        except QQError as exc:
+            # The standby's failure is not the user's problem to fix; the
+            # primary being rate limited is. Report that, and name the second
+            # failure in the hint so the silence is not total.
+            hint = f"The {self.standby.provider_label} standby also failed: {exc.message}"
+            raise RateLimitedError(
+                limited.message,
+                hint=f"{limited.hint} {hint}" if limited.hint else hint,
+                answer=limited.answer,
+            ) from exc
+
+        # Searches the primary ran before it was cut off are still in the
+        # tool's record, and still cost money, so they stay counted.
+        answer.fallback_from = f"{self.primary.provider}:429"
+        return answer
+
+
+def _backend_for(settings: Settings) -> Backend:
+    """Build the one backend these settings name.
 
     Imported lazily so that selecting one provider never pays the import cost
     of the other's credential stack.
     """
-    provider = settings.effective_provider
-    if provider == "openrouter":
+    if settings.effective_provider == "openrouter":
         from .openrouter import OpenRouterBackend
 
         return OpenRouterBackend(settings)
@@ -787,3 +905,11 @@ def build_backend(settings: Settings) -> Backend:
     from .azure import AzureFoundryBackend
 
     return AzureFoundryBackend(settings)
+
+
+def build_backend(settings: Settings, standby: Settings | None = None) -> Backend | FailoverBackend:
+    """Pick a backend, wrapped in a standby when one is configured."""
+    primary = _backend_for(settings)
+    if standby is None:
+        return primary
+    return FailoverBackend(primary, _backend_for(standby))
